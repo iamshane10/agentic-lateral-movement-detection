@@ -32,7 +32,7 @@ Dataset: The LANL Publicly Available Computer Network Dataset (https://csr.lanl.
 
 - Semantic Layer (MCP Servers): A set of specialized Python-based tools that allow the LLM to "query" the graph for complex security logic.
 
-- Orchestration Layer: An LLM Agent (using the Gemini 3 Flash model) that acts as a lead investigator.
+- Orchestration Layer: An LLM Agent (using Navigator AI) that acts as a lead investigator.
 
 - Output Layer: A prioritized risk report with natural language justifications.
 
