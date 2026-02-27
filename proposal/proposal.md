@@ -63,5 +63,13 @@ Baseline B (Static Cypher): A graph approach using fixed, non-AI queries to find
 Ground Truth Collection
 Ground truth is established via the Red Team compromise events provided in the LANL dataset. We will also utilize community-vetted process-to-CPE mappings to ensure our software inventory is technically accurate.
 
+## 5. Timeline
+- Project Proposal	- Mon, Feb 23 - Initial design with research question (Completed)
+- Design Review	- Mon, Mar 2 - Detailed architecture, evaluation plan
+- Code Checkpoint -	Mon, Mar 30 - 	Initial working prototype (includes +1 week than given on website)
+- Draft Paper - Mon, Apr 6	- Complete draft for feedback
+- Final Paper -	Mon, Apr 13	- Polished paper with full evaluation
+- Presentation - Week of Apr 20 - 10-minute presentation + Q&A
+
 ## 6. Conclusion
    By the end of this project, we aim to prove that Agentic AI is not just a wrapper for queries, but a superior method for handling the relational complexity of cybersecurity data. This architecture provides a scalable blueprint for the next generation of Security Data Engineering.
