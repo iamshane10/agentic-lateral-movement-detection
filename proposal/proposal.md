@@ -1,6 +1,6 @@
 # Project Proposal: Agentic Knowledge Graphs for Context-Aware Vulnerability Analysis
 
-Subject: Direction B - Comparative Analysis of Agentic AI vs. Traditional Data Pipelines in Cybersecurity
+Direction B - Comparative Analysis of Agentic AI vs. Traditional Data Pipelines in Cybersecurity
 
 ## 1. Executive Summary
    Modern cybersecurity operations are overwhelmed by "alert fatigue," where thousands of vulnerabilities (CVEs) are identified, but only a fraction are actually reachable or pose a significant threat. This project proposes a novel agentic data pipeline that utilizes a Knowledge Graph (KG) and Model Context Protocol (MCP) servers to autonomously reason about the Attack Surface and Blast Radius of a network. We will evaluate this system against traditional tabular data engineering approaches using the LANL Cybersecurity Dataset.
@@ -32,7 +32,7 @@ Dataset: The LANL Publicly Available Computer Network Dataset (https://csr.lanl.
 
 - Semantic Layer (MCP Servers): A set of specialized Python-based tools that allow the LLM to "query" the graph for complex security logic.
 
-- Orchestration Layer: An LLM Agent (using the Gemini 3 Flash model) that acts as a lead investigator.
+- Orchestration Layer: An LLM Agent (using Navigator AI) that acts as a lead investigator.
 
 - Output Layer: A prioritized risk report with natural language justifications.
 
