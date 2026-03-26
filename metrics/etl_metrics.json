@@ -1,0 +1,84 @@
+{
+  "start_timestamp": "2026-03-13T00:01:07.667595",
+  "dataset_info": {
+    "raw_auth": {
+      "description": "Raw authentication events",
+      "row_count": 1051430459
+    },
+    "raw_proc": {
+      "description": "Raw process events",
+      "row_count": 426045096
+    }
+  },
+  "processing_steps": [
+    {
+      "step": "Database Initialization",
+      "duration_seconds": 0.018,
+      "memory_mb": 44.61,
+      "memory_percent": 0.28
+    },
+    {
+      "step": "Loading Raw Data Views",
+      "duration_seconds": 191.31,
+      "memory_mb": 57.39,
+      "memory_percent": 0.36,
+      "auth_events": 1051430459,
+      "process_events": 426045096
+    },
+    {
+      "step": "Creating Node Tables",
+      "duration_seconds": 678.164,
+      "memory_mb": 85.35,
+      "memory_percent": 0.54
+    },
+    {
+      "step": "Filtering Temporal Events",
+      "duration_seconds": 448.377,
+      "memory_mb": 2842.92,
+      "memory_percent": 18.0
+    },
+    {
+      "step": "Exporting to CSV",
+      "duration_seconds": 185.814,
+      "memory_mb": 6372.75,
+      "memory_percent": 40.36
+    }
+  ],
+  "node_counts": {
+    "Computers": 17666,
+    "Users": 100162
+  },
+  "edge_counts": {},
+  "temporal_reduction": {
+    "Authentications": {
+      "original_count": 1051430459,
+      "filtered_count": 147052681,
+      "removed_count": 904377778,
+      "reduction_percent": 86.01,
+      "retention_percent": 13.99
+    },
+    "Process Events": {
+      "original_count": 426045096,
+      "filtered_count": 54661597,
+      "removed_count": 371383499,
+      "reduction_percent": 87.17,
+      "retention_percent": 12.83
+    },
+    "total": {
+      "original_count": 1477475555,
+      "filtered_count": 201714278,
+      "removed_count": 1275761277,
+      "reduction_percent": 86.35
+    }
+  },
+  "memory_usage": {
+    "final_mb": 6373.04,
+    "peak_mb": 6373.16,
+    "final_percent": 40.36
+  },
+  "timings": {
+    "total_duration_seconds": 1503.711,
+    "total_duration_formatted": "25m 3s"
+  },
+  "end_timestamp": "2026-03-13T00:26:11.381092"
+}
