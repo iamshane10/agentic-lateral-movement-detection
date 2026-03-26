@@ -120,6 +120,16 @@ IMPORT DONE in 12m 4s 96ms.
 8. Run the instance, and open the 'Query' tab on Neo4J to execute a few Cypher queries.
 
 ### Running the Anomaly Detection Agent
+Update your .env file using the following structure:
+```
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=your_password
+NAVIGATOR_API_KEY=your_key
+NAVIGATOR_BASE_URL=your_university_endpoint
+NAVIGATOR_MODEL=gpt-4o
+```
+
 ```
 uv sync
 uv run python .\src\agent\orchestrator.py
