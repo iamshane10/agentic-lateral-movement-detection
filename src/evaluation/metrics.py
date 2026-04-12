@@ -77,7 +77,7 @@ def compute_agent_metrics(results: list[dict]) -> dict:
 
 def compute_baseline_metrics(results: list[dict]) -> dict:
     """
-    Compute metrics from baseline_cypher.py result records.
+    Compute metrics from baseline_evaluator.py result records.
 
     Same ground-truth assumption: every redteam event is a positive.
     Baseline B has no chain reconstruction or tool sequence concept.
@@ -198,7 +198,7 @@ def main() -> None:
     if not args.agent_only:
         if not _BASELINE_RESULTS_PATH.exists():
             print(f"[metrics] Baseline results not found: {_BASELINE_RESULTS_PATH}")
-            print("         Run baseline_cypher.py first.")
+            print("         Run baseline_evaluator.py first.")
         else:
             with open(_BASELINE_RESULTS_PATH) as fh:
                 data = json.load(fh)

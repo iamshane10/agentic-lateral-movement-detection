@@ -181,72 +181,72 @@ def get_lateral_movement_path(
         "count": len(rows),
     })
 
-# ---------------------------------------------------------------------------
-# Tool 6: get_host_neighbors // slow - unresponsive
-# ---------------------------------------------------------------------------
-
-HOST_NEIGHBORS_QUERY = """
-MATCH (src:Computer {name: $computer})<-[a1:AUTHENTICATED_TO]-(u:User)
-      -[a2:AUTHENTICATED_TO]->(dst:Computer)
-WHERE a1.time >= $start_time AND a1.time <= $end_time
-AND a2.time >= $start_time AND a2.time <= $end_time
-AND dst.name <> $computer
-AND a1.status = "Success"
-RETURN DISTINCT dst.name as reachable_computer,
-       collect(DISTINCT u.username) as via_users,
-       count(DISTINCT u) as user_count
-ORDER BY user_count DESC
-"""
-
-
-@mcp.tool()
-def get_host_neighbors(computer: str, start_time: int, end_time: int) -> str:
-    """
-    Return all computers reachable from a given host within one authentication
-    hop. Defines the blast radius of a compromised host.
-
-    Reachability is defined by authentication paths — users who authenticated
-    to the given host and also authenticated to another host within the window.
-    Does not require flows.txt.
-
-    Args:
-        computer:   Source computer name (e.g. 'C17')
-        start_time: Window start — LANL internal integer (elapsed seconds)
-        end_time:   Window end   — LANL internal integer (elapsed seconds)
-
-    Returns:
-        JSON string with reachable computers and bridging users, or an
-        empty-result message if no neighbors are found.
-    """
-    try:
-        rows = _run_query(HOST_NEIGHBORS_QUERY, {
-            "computer": computer,
-            "start_time": start_time,
-            "end_time": end_time,
-        })
-    except neo4j_exceptions.Neo4jError as exc:
-        return json.dumps({"error": str(exc), "computer": computer})
-
-    if not rows:
-        return json.dumps({
-            "computer": computer,
-            "message": "No reachable neighbor computers found from this host in the specified window.",
-            "neighbors": [],
-            "count": 0,
-        })
-
-    return json.dumps({
-        "computer": computer,
-        "neighbors": [
-            {
-                "reachable_computer": row["reachable_computer"],
-                "via_users": row["via_users"],
-                "user_count": row["user_count"],
-            }
-            for row in rows
-        ],
-        "count": len(rows),
-    })
+# # ---------------------------------------------------------------------------
+# # Tool 6: get_host_neighbors // slow - unresponsive
+# # ---------------------------------------------------------------------------
+#
+# HOST_NEIGHBORS_QUERY = """
+# MATCH (src:Computer {name: $computer})<-[a1:AUTHENTICATED_TO]-(u:User)
+#       -[a2:AUTHENTICATED_TO]->(dst:Computer)
+# WHERE a1.time >= $start_time AND a1.time <= $end_time
+# AND a2.time >= $start_time AND a2.time <= $end_time
+# AND dst.name <> $computer
+# AND a1.status = "Success"
+# RETURN DISTINCT dst.name as reachable_computer,
+#        collect(DISTINCT u.username) as via_users,
+#        count(DISTINCT u) as user_count
+# ORDER BY user_count DESC
+# """
+#
+#
+# @mcp.tool()
+# def get_host_neighbors(computer: str, start_time: int, end_time: int) -> str:
+#     """
+#     Return all computers reachable from a given host within one authentication
+#     hop. Defines the blast radius of a compromised host.
+#
+#     Reachability is defined by authentication paths — users who authenticated
+#     to the given host and also authenticated to another host within the window.
+#     Does not require flows.txt.
+#
+#     Args:
+#         computer:   Source computer name (e.g. 'C17')
+#         start_time: Window start — LANL internal integer (elapsed seconds)
+#         end_time:   Window end   — LANL internal integer (elapsed seconds)
+#
+#     Returns:
+#         JSON string with reachable computers and bridging users, or an
+#         empty-result message if no neighbors are found.
+#     """
+#     try:
+#         rows = _run_query(HOST_NEIGHBORS_QUERY, {
+#             "computer": computer,
+#             "start_time": start_time,
+#             "end_time": end_time,
+#         })
+#     except neo4j_exceptions.Neo4jError as exc:
+#         return json.dumps({"error": str(exc), "computer": computer})
+#
+#     if not rows:
+#         return json.dumps({
+#             "computer": computer,
+#             "message": "No reachable neighbor computers found from this host in the specified window.",
+#             "neighbors": [],
+#             "count": 0,
+#         })
+#
+#     return json.dumps({
+#         "computer": computer,
+#         "neighbors": [
+#             {
+#                 "reachable_computer": row["reachable_computer"],
+#                 "via_users": row["via_users"],
+#                 "user_count": row["user_count"],
+#             }
+#             for row in rows
+#         ],
+#         "count": len(rows),
+#     })
 
 
 if __name__ == "__main__":

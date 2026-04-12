@@ -34,10 +34,10 @@ Can an LLM-orchestrated Knowledge Graph detect lateral movement and host comprom
 
 ### 2.2 Relationship Types
 
-| Relationship | Direction | Properties                                                                                                                             |
-|---|---|----------------------------------------------------------------------------------------------------------------------------------------|
-| `AUTHENTICATED_TO` | User → Computer | `time` (long), `auth_type` (string), `logon_type` (string), `orientation` (string), `status` (string -> values are "Success" or "Fail") |
-| `EXECUTED` | User → Computer | `time` (long), `process_name` (string), `event_type` (string)                                                                          |
+| Relationship | Direction | Properties                                                                                                                              |
+|---|---|-----------------------------------------------------------------------------------------------------------------------------------------|
+| `AUTHENTICATED_TO` | User → Computer | `time` (long), `auth_type` (string), `logon_type` (string), `orientation` (string), `status` (string — values are `"Success"` or `"Fail"`) |
+| `EXECUTED` | User → Computer | `time` (long), `process_name` (string), `event_type` (string)                                                                           |
 
 ### 2.3 Removed From Schema
 - **Process nodes** — anonymized names (`P131`) carry no semantic value as standalone nodes
@@ -50,8 +50,9 @@ NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=your_password
 NAVIGATOR_API_KEY=your_key
-NAVIGATOR_BASE_URL=your_university_endpoint
+NAVIGATOR_API_BASE=your_university_endpoint
 NAVIGATOR_MODEL=gpt-4o
+REDTEAM_PATH=data/redteam.txt
 ```
 
 ### 2.5 Project Structure
@@ -60,19 +61,24 @@ cis6930sp26-project/
 ├── REFERENCE.md
 ├── .env
 ├── uv.lock
-├── src
+├── src/
 │   ├── servers/
-│       ├── behavioral_server.py
-│       ├── topology_server.py
-│       └── investigation_server.py
+│   │   ├── behavioral_server.py
+│   │   ├── topology_server.py
+│   │   └── investigation_server.py
 │   ├── agent/
-│       ├── orchestrator.py
-│       └── system_prompt.py
+│   │   └── orchestrator.py        # system prompt is built dynamically here
 │   ├── evaluation/
 │   │   ├── evaluator.py
-│       └── metrics.py
-└── data/
-    └── redteam.txt
+│   │   ├── baseline_cypher.py
+│   │   └── metrics.py
+│   └── utils/
+│       ├── performance_tracker.py
+│       └── distribution_analysis.py
+├── data/
+│   └── redteam.txt
+└── evaluation/
+    └── results.json               # written by evaluator.py
 ```
 
 ---
@@ -87,7 +93,7 @@ All Neo4j credentials are loaded via `load_dotenv()` from the `.env` file. No ha
 
 ### Server 1: Behavioral Server (`behavioral_server.py`)
 
-**Purpose:** Answers whether a user or host is behaving abnormally. Always the first server called in an investigation. Operates on authentication failure rates, new user-host relationships, and novel process execution patterns.
+**Purpose:** Answers whether a user or host is behaving abnormally. In the current two-phase architecture, behavioral signals are used in **Phase 1 Discovery** — the orchestrator runs equivalent queries directly against Neo4j (not via LLM tool calls). These tools remain available on the server but are not exposed to the LLM.
 
 ---
 
@@ -110,7 +116,7 @@ MATCH (u:User {username: $username})-[a:AUTHENTICATED_TO]->(c:Computer)
 WHERE a.time >= $start_time AND a.time <= $end_time
 WITH u,
      count(a) as total_attempts,
-     sum(CASE WHEN a.status = false THEN 1 ELSE 0 END) as failed_attempts,
+     sum(CASE WHEN a.status = "Success" THEN 1 ELSE 0 END) as failed_attempts,
      collect(DISTINCT c.name) as target_computers,
      collect(DISTINCT a.auth_type) as auth_types_used
 RETURN u.username as username,
@@ -193,13 +199,13 @@ RETURN u.username as username,
        total_in_window
 ```
 
-**Rationale:** Called after `get_first_time_authentications` confirms suspicious access. Novel process execution on a newly accessed host is a second-layer corroboration signal. Process names are anonymized but behavioral novelty is still meaningful.
+**Rationale:** Novel process execution on a newly accessed host is a second-layer corroboration signal. Process names are anonymized but behavioral novelty is still meaningful. Note: this tool returns sparse results in practice — process events are sparser than auth events in the LANL dataset.
 
 ---
 
 ### Server 2: Topology Server (`topology_server.py`)
 
-**Purpose:** Answers how connected and structurally significant a host is. Operates on graph structure rather than individual events. This is where the Knowledge Graph demonstrably outperforms SQL — expressing network reachability and pivot point identification through graph traversal.
+**Purpose:** Answers how connected and structurally significant a host is. Called in **Phase 2** by the LLM. This is where the Knowledge Graph demonstrably outperforms SQL — expressing network reachability and pivot point identification through graph traversal.
 
 ---
 
@@ -223,7 +229,7 @@ WHERE a.time >= $start_time AND a.time <= $end_time
 WITH c,
      count(DISTINCT u) as unique_users,
      count(a) as total_auth_events,
-     sum(CASE WHEN a.status = false THEN 1 ELSE 0 END) as failed_auths,
+     sum(CASE WHEN a.status = "Fail" THEN 1 ELSE 0 END) as failed_auths,
      collect(DISTINCT u.username) as users
 RETURN c.name as computer,
        unique_users,
@@ -239,13 +245,12 @@ ORDER BY unique_users DESC
 
 #### Tool 5: `get_lateral_movement_path`
 
-**Purpose:** Reconstructs the authentication chain between source and destination host via shared users. Core tool for attack path reconstruction.
+**Purpose:** Reconstructs the chronological sequence of hosts a user authenticated to within the investigation window. In the LANL dataset, `src_host` from `redteam.txt` represents the attacker's originating machine and does not appear as an authentication *destination* in auth logs — so movement chains are reconstructed from sequential auth events to destination hosts.
 
 **Input Schema:**
 ```json
 {
-  "source_computer": "string",
-  "target_computer": "string",
+  "username": "string",
   "start_time": "int",
   "end_time": "int"
 }
@@ -253,42 +258,29 @@ ORDER BY unique_users DESC
 
 **Cypher Query:**
 ```cypher
-MATCH path = (src:Computer {name: $source_computer})
-      <-[a1:AUTHENTICATED_TO]-(u:User)
-      -[a2:AUTHENTICATED_TO]->(dst:Computer {name: $target_computer})
-WHERE a1.time >= $start_time AND a1.time <= $end_time
-AND a2.time >= $start_time AND a2.time <= $end_time
-AND a2.time >= a1.time
-AND a1.status = "Success"
-AND a2.status = "Success"
-RETURN u.username as pivot_user,
-       src.name as source_computer,
-       a1.time as auth_from_source_time,
-       dst.name as target_computer,
-       a2.time as auth_to_target_time,
-       (a2.time - a1.time) as time_delta
-ORDER BY time_delta ASC
-LIMIT 20
+MATCH (u:User {username: $username})-[a:AUTHENTICATED_TO]->(c:Computer)
+WHERE a.time >= $start_time AND a.time <= $end_time
+AND a.status = "Success"
+RETURN u.username as username,
+       c.name as computer,
+       a.time as auth_time,
+       a.auth_type as auth_type
+ORDER BY a.time ASC
 ```
 
-**Rationale:** Finds users who authenticated FROM source then TO target in chronological order. A small `time_delta` (under 300 seconds) is a strong lateral movement indicator. Directly maps to what `redteam.txt` validates: source host to destination host transitions.
+**Returns:** Ordered authentication chain for the user (`chain` list of `{computer, auth_time, auth_type}`).
+
+**Rationale:** A rapid sequence of authentications to multiple distinct hosts is a strong lateral movement indicator. The `time_delta` between consecutive hops is the key signal — short deltas (under 300 seconds) indicate automated or scripted movement.
 
 ---
 
-#### Tool 6: `get_host_neighbors`
+#### Tool 6: `get_host_neighbors` *(commented out — performance issue)*
 
-**Purpose:** Returns all computers reachable from a given host within one authentication hop. Defines blast radius of a compromised host.
+**Status:** Disabled. The query is implemented but commented out in `topology_server.py` due to timeout issues on large windows. It is not registered as an MCP tool and is not available to the LLM.
 
-**Input Schema:**
-```json
-{
-  "computer": "string",
-  "start_time": "int",
-  "end_time": "int"
-}
-```
+**Original purpose:** Returns all computers reachable from a given host within one authentication hop — defines the blast radius of a compromised host.
 
-**Cypher Query:**
+**Cypher Query (disabled):**
 ```cypher
 MATCH (src:Computer {name: $computer})<-[a1:AUTHENTICATED_TO]-(u:User)
       -[a2:AUTHENTICATED_TO]->(dst:Computer)
@@ -302,13 +294,11 @@ RETURN DISTINCT dst.name as reachable_computer,
 ORDER BY user_count DESC
 ```
 
-**Rationale:** Replaces the original Reachability Server without requiring `flows.txt`. Reachability is defined by authentication paths rather than network ports — valid given `redteam.txt` validates at host level, not port level.
-
 ---
 
 ### Server 3: Investigation Server (`investigation_server.py`)
 
-**Purpose:** Aggregates evidence once suspicious activity is already identified. Called last in the investigation sequence. Outputs directly feed the Explainability Score metric and the agent's natural language justification.
+**Purpose:** Aggregates evidence once suspicious activity is already identified. Called in **Phase 2** by the LLM. Outputs directly feed the Explainability Score metric and the agent's natural language justification.
 
 ---
 
@@ -337,7 +327,7 @@ WITH u,
          event_type: 'AUTH',
          time: a.time,
          computer: c1.name,
-         status: a.status,
+         success: a.status,
          auth_type: a.auth_type,
          detail: a.logon_type
      }) as auth_events,
@@ -382,7 +372,7 @@ WHERE e.time >= $start_time AND e.time <= $end_time
 WITH c,
      count(DISTINCT u) as unique_auth_users,
      count(a) as total_auths,
-     sum(CASE WHEN a.status = false THEN 1 ELSE 0 END) as failed_auths,
+     sum(CASE WHEN a.status = "Success" THEN 1 ELSE 0 END) as failed_auths,
      collect(DISTINCT u.username) as auth_users,
      count(DISTINCT u2) as unique_exec_users,
      collect(DISTINCT e.process_name) as processes_executed,
@@ -397,7 +387,7 @@ RETURN c.name as computer,
        total_executions
 ```
 
-**Rationale:** First tool called when investigating a suspicious destination host. Answers who else was on this machine and what was running — essential for blast radius assessment and scoping the full impact of a compromise.
+**Rationale:** Answers who was on this machine and what was running — essential for blast radius assessment and scoping the full impact of a compromise.
 
 ---
 
@@ -433,128 +423,282 @@ ORDER BY time_delta_from_event ASC
 
 ## 4. Agent Orchestration
 
-### 4.1 How Tool Calling Works
-1. Tool schemas are registered with LiteLLM at session start
-2. LLM receives an investigation prompt and returns a `tool_call` request (JSON)
-3. `orchestrator.py` intercepts the request and routes it to the correct MCP server
-4. MCP server runs Cypher against Neo4j and returns structured JSON
-5. Result is appended to the conversation and sent back to the LLM
-6. Loop continues until the LLM stops calling tools and produces a final verdict
+### 4.1 Architecture Overview — Two-Phase Blind Investigation
 
-### 4.2 Investigation Trigger
-
-For each event in `redteam.txt`, extract: `timestamp, username, source_host, destination_host`
-
-Pass to the agent as:
-```
-Investigate potential suspicious activity involving user {username}
-between host {source_host} and host {destination_host}
-around time {timestamp}.
-```
-
-**The agent must never be told the event is a confirmed compromise.** `redteam.txt` is the grading key, not the investigation input.
-
-### 4.3 Time Windows
-- All tool calls use: `start_time = T - 3600`, `end_time = T + 3600`
-- `get_concurrent_sessions` uses a tighter window: `window = 300`
-
-### 4.4 System Prompt (`system_prompt.py`)
+The orchestrator (`orchestrator.py`) uses a **two-phase blind investigation** approach. No usernames or hostnames are ever given as inputs — the agent discovers suspicious entities from behavioral signals alone.
 
 ```
-You are an expert cybersecurity investigator analyzing authentication
-and process execution logs from an enterprise network. Your goal is
-to determine whether a given user and host combination shows evidence
-of lateral movement or compromise.
+investigate_window(start_time, end_time) -> dict
+```
 
-You have access to a knowledge graph of network behavior via tools.
-You MUST always use tools to support your conclusions.
-Never speculate or infer without querying the graph first.
+**Phase 1 — Discovery (orchestrator-level, no LLM):**
+Three Cypher queries run directly against Neo4j to surface candidate suspicious users from behavioral signals only. The LLM never sees this phase.
+
+**Phase 2 — Investigation (LLM-driven, entity-centric):**
+The top-3 ranked candidates from Phase 1 are injected into the system prompt. The LLM selects which topology and investigation tools to call per candidate and produces a final structured verdict.
 
 ---
 
-INVESTIGATION SEQUENCE
+### 4.2 Phase 1 — Discovery Queries
 
-You must follow this exact sequence for every investigation:
+The orchestrator runs these three queries directly against Neo4j (not via MCP tools):
 
-PHASE 1 - BEHAVIORAL ANALYSIS
-1. get_auth_anomalies
-2. get_first_time_authentications
-3. get_process_anomalies
+**Query 1: Auth Anomaly Discovery** — users with high failure rate (>30%) or many distinct targets (≥4):
+```cypher
+MATCH (u:User)-[a:AUTHENTICATED_TO]->(c:Computer)
+WHERE a.time >= $start_time AND a.time <= $end_time
+WITH u,
+     count(a) AS total_attempts,
+     sum(CASE WHEN a.status = 'Fail' THEN 1 ELSE 0 END) AS failed_attempts,
+     count(DISTINCT c) AS unique_targets
+WITH u, total_attempts, failed_attempts, unique_targets,
+     CASE WHEN total_attempts > 0
+          THEN round(toFloat(failed_attempts) / toFloat(total_attempts) * 100, 2)
+          ELSE 0.0 END AS failure_rate_pct
+WHERE failure_rate_pct > 30.0 OR unique_targets >= 4
+RETURN u.username AS username, total_attempts, failed_attempts,
+       failure_rate_pct, unique_targets
+ORDER BY failure_rate_pct DESC, unique_targets DESC
+LIMIT 20
+```
 
-PHASE 2 - TOPOLOGY ANALYSIS
-4. get_lateral_movement_path
-5. get_host_centrality
-6. get_host_neighbors
+**Query 2: First-Time Auth Discovery** — users who successfully authenticated to hosts they had never accessed before:
+```cypher
+MATCH (u:User)-[a:AUTHENTICATED_TO]->(c:Computer)
+WHERE a.time >= $start_time AND a.time <= $end_time AND a.status = 'Success'
+WITH u, c, min(a.time) AS first_seen_in_window
+WHERE NOT EXISTS {
+    MATCH (u)-[prev:AUTHENTICATED_TO]->(c)
+    WHERE prev.time < $start_time AND prev.status = 'Success'
+}
+WITH u, count(c) AS new_host_count
+WHERE new_host_count >= 1
+RETURN u.username AS username, new_host_count
+ORDER BY new_host_count DESC
+LIMIT 20
+```
 
-PHASE 3 - INVESTIGATION SUMMARY
-7. get_user_timeline
-8. get_host_activity_summary
-9. get_concurrent_sessions
+**Query 3: Process Anomaly Discovery** — users who authenticated to hosts in the window that they had never accessed historically:
+```cypher
+MATCH (u:User)-[a:AUTHENTICATED_TO]->(c:Computer)
+WHERE a.time < 150000 AND a.status = 'Success'
+WITH u, collect(DISTINCT c.name) AS historical_hosts
+MATCH (u)-[b:AUTHENTICATED_TO]->(c2:Computer)
+WHERE b.time >= 150000 AND b.time <= 157200 AND b.status = 'Success'
+WITH u, historical_hosts, collect(DISTINCT c2.name) AS window_hosts
+WITH u,
+     [h IN window_hosts WHERE NOT h IN historical_hosts] AS new_hosts
+WHERE size(new_hosts) >= 1
+RETURN u.username AS username, size(new_hosts) AS new_host_count
+ORDER BY new_host_count DESC
+LIMIT 20
+```
+
+**Candidate ranking:** Each query contributes a list of usernames. A `Counter` tallies cross-query frequency. The top-3 by frequency become the `ranked_candidates` passed to Phase 2.
+
+If zero candidates are found, Phase 2 is skipped entirely and the result is returned immediately with `severity = LOW`.
 
 ---
 
-REASONING RULES
+### 4.3 Phase 2 — LLM Investigation
 
-- Complete all three phases before producing a verdict
-- If a tool returns empty results, note it explicitly and continue
-- Do not repeat tool calls with identical parameters
-- Time values are LANL internal integers, not Unix timestamps
-- time_delta under 300 in get_lateral_movement_path = strong lateral movement signal
-- High failure_rate_pct combined with many unique_targets = strong compromise signal
-- New auth relationships coinciding with new process execution = high confidence signal
+**Tools available to the LLM (Phase 2 only):**
+
+| Tool | Server |
+|------|--------|
+| `get_lateral_movement_path` | `topology_server.py` |
+| `get_host_centrality` | `topology_server.py` |
+| `get_user_timeline` | `investigation_server.py` |
+| `get_host_activity_summary` | `investigation_server.py` |
+| `get_concurrent_sessions` | `investigation_server.py` |
+
+Behavioral tools (`get_auth_anomalies`, `get_first_time_authentications`, `get_process_anomalies`) are **not** exposed to the LLM — they are Phase 1 only.
+`get_host_neighbors` is excluded (disabled).
+
+**Tool dispatch:** The orchestrator calls server functions directly (not via subprocess MCP protocol):
+```python
+_TOOL_DISPATCH = {
+    "get_lateral_movement_path": topology_server.get_lateral_movement_path,
+    "get_host_centrality": topology_server.get_host_centrality,
+    "get_user_timeline": investigation_server.get_user_timeline,
+    "get_host_activity_summary": investigation_server.get_host_activity_summary,
+    "get_concurrent_sessions": investigation_server.get_concurrent_sessions,
+}
+```
+
+**Hard limits:**
+- `_MAX_ITERATIONS = 20` — max total tool calls (Phase 1 + Phase 2 combined)
+- `MAX_RESULT_CHARS = 2000` — tool result truncation limit
+- Context limit guard: raises `RuntimeError` if estimated tokens exceed 50,000
+
+**LLM config:**
+- Model: `openai/{NAVIGATOR_MODEL}` via LiteLLM
+- `base_url`: `NAVIGATOR_API_BASE` env var
+- `temperature=0`, `max_tokens=1000`
+- Token estimation via `tiktoken` (gpt-4o encoding)
+
+---
+
+### 4.4 System Prompt (Dynamic)
+
+The system prompt is built at runtime by `_build_system_prompt(candidates, start_time, end_time)` in `orchestrator.py`. There is no separate `system_prompt.py`.
+
+```
+You are a security investigator. You will first call discovery tools to identify
+suspicious entities from behavioral signals alone. Only after discovery will you
+investigate specific entities. Never assume who is suspicious — let the data tell you.
+
+Phase 1 discovery is already complete. Never call Phase 2 tools before Phase 1 is complete.
+
+The following candidate users were identified from behavioral signals (high authentication
+failure rates, first-time authentications to new hosts, novel process executions):
+
+CANDIDATES: {candidate_str}
+
+---
+
+PHASE 2 — INVESTIGATION
+
+Investigate each candidate using the available tools. Use start_time={start_time} and
+end_time={end_time} for all tool calls that require a time window.
+
+RULES:
+- Do not call all tools on every candidate blindly — use judgment about which tools add signal.
+- Do not repeat tool calls with identical parameters.
+- Time values are LANL internal integers, not Unix timestamps.
+- A rapid sequence of authentications to multiple hosts = strong lateral movement signal.
+- If a tool returns empty results, note it and move on.
+- You have a limited tool call budget. Prioritize the most informative tools.
 
 ---
 
 FINAL OUTPUT FORMAT
 
-After completing all three phases, produce your verdict in exactly
-this structure:
+After investigation, produce exactly this structure — nothing before it:
 
-VERDICT: [HIGH / MEDIUM / LOW]
-
-EVIDENCE SUMMARY:
-- Behavioral signals: [summarize key findings from phase 1]
-- Topology signals: [summarize key findings from phase 2]
-- Timeline narrative: [plain English sequence of events from phase 3]
-
-ATTACK PATH:
-User X authenticated from Host A at time T1,
-then to Host B at time T2 (delta: N seconds)
-[or: No direct authentication chain reconstructed]
-
-CONFIDENCE REASONING:
-[One paragraph citing specific numbers from tool outputs]
+SEVERITY: HIGH / MEDIUM / LOW
+FLAGGED_USERS: comma-separated list of suspicious usernames (or NONE)
+FLAGGED_HOSTS: comma-separated list of suspicious host names (or NONE)
+NARRATIVE: [one to three paragraphs — summarize evidence, attack path if found, and reasoning]
 ```
+
+---
+
+### 4.5 Output Parsing
+
+The orchestrator parses the LLM's final text output with three regex patterns:
+- `SEVERITY\s*:\s*(HIGH|MEDIUM|LOW)` → `severity`
+- `FLAGGED_USERS\s*:\s*([^\n]+)` → `flagged_users` (list)
+- `FLAGGED_HOSTS\s*:\s*([^\n]+)` → `flagged_hosts` (list)
+
+If no `SEVERITY` match is found, defaults to `LOW`.
+
+**Return dict from `investigate_window()`:**
+```json
+{
+  "window":          {"start": int, "end": int},
+  "flagged_users":   ["U456@DOM1", ...],
+  "flagged_hosts":   ["C17", ...],
+  "verdict":         "free-text LLM narrative",
+  "severity":        "HIGH / MEDIUM / LOW",
+  "tool_calls_made": int
+}
+```
+
+**`investigate_event(username, dst_host, timestamp)` — used by entity evaluator:**
+
+Accepts a known entity from a redteam event. Builds a ±3600 s window around `timestamp`, injects the single username as the sole candidate into `_build_system_prompt`, then runs Phase 2 (LLM tool loop) only. The agent receives no label — it determines severity from behavioral signals alone.
+
+```json
+{
+  "event":           {"username": str, "dst_host": str, "timestamp": int},
+  "flagged_users":   ["U456@DOM1", ...],
+  "flagged_hosts":   ["C17", ...],
+  "verdict":         "free-text LLM narrative",
+  "severity":        "HIGH / MEDIUM / LOW",
+  "tool_calls_made": int
+}
+```
+
+---
+
+### 4.6 Time Windows
+- Phase 1 discovery queries use the full `[start_time, end_time]` window passed in
+- Phase 2 LLM tool calls use the same `start_time` / `end_time` injected via system prompt
+- `get_concurrent_sessions` uses a tighter `window = 300` (±300 seconds around event time)
 
 ---
 
 ## 5. Evaluation Design
 
-### 5.1 Evaluation Loop (`evaluator.py`)
+### 5.1 Evaluation Modes (`evaluator.py`)
+
+Two modes, selected via `--mode` CLI flag:
+
+**`window` mode (recall-only, default):**
 ```
-for each event in redteam.txt:
-    1. Extract {timestamp, username, src_host, dst_host}
-    2. Send investigation prompt to agent via LiteLLM
-    3. Agent calls tools, produces verdict
-    4. Parse VERDICT field from agent output
-    5. Label as True Positive if VERDICT == HIGH
-    6. Log full tool call sequence and raw output for explainability scoring
+Parse redteam.txt for timestamps only (user/host columns ignored).
+Filter to fixed window [763200, 764600].
+Call investigate_event(username, dst_host, timestamp) for each event sequentially.
+Score: severity in {HIGH, MEDIUM} → TP; severity == LOW → FN.
+Output: evaluation/results_YYYYMMDD_HHMMSS.json
+```
+
+**`entity` mode (precision + recall + F1, concurrent):**
+```
+Stage 1 — Case construction:
+    Parse redteam.txt. Filter to fixed window [763200, 764600].
+    Shuffle and cap at --sample-size (default 20) → TP cases.
+    Query Neo4j for control candidates from CONTROL_WINDOW_START=767000
+    to CONTROL_WINDOW_END=770400 (quiet post-attack window, no redteam events).
+    Control filters: exclude machine accounts ($), ANONYMOUS users, and any
+    username appearing anywhere in redteam.txt.
+    Build balanced case list: TP cases + equal number of FP control cases.
+
+Stage 2 — Concurrent investigation:
+    Run investigate_event() on all cases via ThreadPoolExecutor(max_workers=3).
+    MAX_CONCURRENT_INVESTIGATIONS = 3 (stays within 120 RPM Navigator limit;
+    3 concurrent × ~4 LLM calls each ≈ 12 calls/min peak).
+    Results arrive via as_completed() and are flushed to disk after each case.
+    HTTP 429 from Navigator: sleep 10 s, record case as error, no retry.
+    elapsed_seconds per case = individual wall time for that investigation.
+    total_elapsed_seconds in meta = executor wall time (submit → last future done).
+
+Stage 3 — Scoring:
+    is_redteam=True  + severity in {HIGH,MEDIUM} → TP
+    is_redteam=True  + severity == LOW            → FN
+    is_redteam=False + severity in {HIGH,MEDIUM}  → FP
+    is_redteam=False + severity == LOW            → TN
+    Compute precision, recall, F1. Print summary.
+Output: evaluation/entity_results_YYYYMMDD_HHMMSS.json
+```
+
+**Helper functions extracted from `run_entity_evaluation()`:**
+- `_flush_results(results, output_path)` — incremental JSON write after each completed future
+- `_score_result(result)` — returns `"TP"/"TN"/"FP"/"FN"` from `is_redteam` + `severity`
+
+**Entry point:**
+```bash
+uv run python -m src.evaluation.evaluator --mode window
+uv run python -m src.evaluation.evaluator --mode entity --sample-size 20
 ```
 
 ### 5.2 Metrics
 
 | Metric | Definition |
 |--------|------------|
-| Precision / Recall | Computed against `redteam.txt`. True Positive = agent correctly labels a red team event as HIGH risk. |
-| Lateral Movement Chain Accuracy | Did `get_lateral_movement_path` reconstruct a valid src→dst auth chain for confirmed red team events? |
-| Explainability Score | Does the agent's CONFIDENCE REASONING cite specific tool output values? Scored manually per investigation. |
+| Precision | `TP / (TP + FP)` — of all flagged windows, how many had real redteam activity |
+| Recall | `TP / (TP + FN)` — of all windows with redteam activity, how many were caught |
+| F1 | Harmonic mean of precision and recall |
+
+True Positive definition: `flagged_users ∩ redteam_users ≠ ∅` OR `flagged_hosts ∩ redteam_hosts ≠ ∅` in the same window.
 
 ### 5.3 Baselines
 
-| Baseline | Approach |
-|----------|----------|
-| Baseline A (SQL) | Join auth table: flag users with `failure_rate > threshold` across N distinct hosts within window. No graph traversal. |
-| Baseline B (Static Cypher) | Fixed Cypher query: find users who authenticated to a new host within the window. No LLM reasoning, no multi-tool orchestration. |
+| Baseline | File | Approach |
+|----------|------|----------|
+| Baseline A (SQL) | *(external)* | Join auth table: flag users with `failure_rate > threshold` across N distinct hosts within window. No graph traversal. |
+| Baseline B (Static Cypher) | `src/evaluation/baseline_cypher.py` | Fixed Cypher query: find users who authenticated to a new host within the window. No LLM reasoning, no multi-tool orchestration. |
 
 Both baselines evaluate against the same `redteam.txt` events using the same precision/recall methodology.
 
@@ -567,13 +711,12 @@ Follow this exact order. Do not begin the orchestrator until all MCP servers are
 | Step | Task |
 |------|------|
 | 1 | Build `behavioral_server.py` — all three tools. Test each Cypher query in Neo4j browser before wiring up. |
-| 2 | Build `topology_server.py` — all three tools. |
+| 2 | Build `topology_server.py` — two active tools (`get_host_centrality`, `get_lateral_movement_path`). |
 | 3 | Build `investigation_server.py` — all three tools. |
-| 4 | Build `orchestrator.py` — wire LiteLLM to all servers. Test with a single hardcoded redteam event first. |
-| 5 | Build `system_prompt.py` — paste exact prompt from Section 4.4. |
-| 6 | Build `evaluator.py` — iterate over `redteam.txt`, collect verdicts. |
-| 7 | Build `metrics.py` — compute precision, recall, chain accuracy. |
-| 8 | Build SQL and Static Cypher baselines for comparison. |
+| 4 | Build `orchestrator.py` — Phase 1 discovery queries + Phase 2 LLM loop. Test with `investigate_window(763200, 770000)`. System prompt is built dynamically inside this file — no separate `system_prompt.py`. |
+| 5 | Build `evaluator.py` — iterate over `redteam.txt` windows, collect verdicts, score. |
+| 6 | Build `metrics.py` — compute precision, recall, F1. |
+| 7 | Build `baseline_cypher.py` — static Cypher baseline for comparison. |
 
 ---
 
@@ -585,4 +728,6 @@ Follow this exact order. Do not begin the orchestrator until all MCP servers are
 - **Process names:** Anonymized (`P131`). No CVE or CPE mapping. Behavioral novelty only.
 - **Tool calling:** Verify Navigator AI model supports tool/function calling before building orchestrator. GPT-4o recommended over Llama variants for reliability.
 - **Credentials:** Always load via `load_dotenv()` from `.env`. No hardcoded keys anywhere.
-- **Tool call sequence:** The system prompt enforces a fixed 9-tool sequence for every investigation. Do not let the LLM choose its own order — reproducibility is required for evaluation.
+- **Blind investigation:** The orchestrator never accepts usernames or hostnames as input — only a time window. Entity discovery is purely signal-driven.
+- **`get_host_neighbors` disabled:** Do not re-enable without adding a LIMIT or index hint — the two-hop query is unresponsive on large windows.
+- **Phase 1 process anomaly query:** Uses hardcoded time boundaries (`150000`, `157200`) — update these if evaluating different day windows.

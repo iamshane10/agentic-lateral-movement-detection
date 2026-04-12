@@ -11,4 +11,5 @@ dependencies = [
     "neo4j>=5.0.0",
     "psutil>=7.2.2",
     "python-dotenv>=1.2.2",
+    "tiktoken>=0.12.0",
 ]
