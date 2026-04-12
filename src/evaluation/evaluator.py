@@ -172,10 +172,10 @@ def _score_window(result: dict, redteam_events: list[dict]) -> dict:
 # Entity evaluation helpers
 # ---------------------------------------------------------------------------
 
-def _flush_results(results: list[dict], output_path: Path) -> None:
+def _flush_results(results: list[dict], output_path: Path, total_tokens: int = 0) -> None:
     """Write results list to disk incrementally (called after each completed case)."""
     with open(output_path, "w", encoding="utf-8") as f:
-        json.dump({"results": results}, f, indent=2, default=str)
+        json.dump({"total_tokens": total_tokens, "results": results}, f, indent=2, default=str)
 
 
 def _score_result(result: dict) -> str:
@@ -239,6 +239,7 @@ def run_evaluation(redteam_path: Path = _REDTEAM_PATH) -> list[dict]:
     total_events = len(window_events)
     event_results: list[dict] = []
     total_tool_calls = 0
+    total_tokens = 0
     tp_count = 0
     fn_count = 0
 
@@ -263,12 +264,15 @@ def run_evaluation(redteam_path: Path = _REDTEAM_PATH) -> list[dict]:
                 "verdict": "",
                 "severity": "LOW",
                 "tool_calls_made": 0,
+                "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             }
             error = str(exc)
             print(f"           ERROR: {error}")
 
         severity = result["severity"]
         total_tool_calls += result["tool_calls_made"]
+        event_tokens = result.get("token_usage", {}).get("total_tokens", 0)
+        total_tokens += event_tokens
 
         flagged = severity in {"HIGH", "MEDIUM"}
         if flagged:
@@ -280,7 +284,7 @@ def run_evaluation(redteam_path: Path = _REDTEAM_PATH) -> list[dict]:
 
         print(
             f"           severity={severity:<6}  outcome={outcome}  "
-            f"tool_calls={result['tool_calls_made']}  elapsed={elapsed:.1f}s\n"
+            f"tool_calls={result['tool_calls_made']}  tokens={event_tokens}  elapsed={elapsed:.1f}s\n"
         )
 
         event_results.append({
@@ -296,10 +300,12 @@ def run_evaluation(redteam_path: Path = _REDTEAM_PATH) -> list[dict]:
         with open(results_path, "w") as fh:
             json.dump(
                 {
+                    "total_tokens": total_tokens,
                     "meta": {
                         "total_events": total_events,
                         "evaluated": idx,
                         "total_tool_calls_so_far": total_tool_calls,
+                        "total_tokens_so_far": total_tokens,
                     },
                     "results": event_results,
                 },
@@ -316,6 +322,7 @@ def run_evaluation(redteam_path: Path = _REDTEAM_PATH) -> list[dict]:
     print(f"            False Negatives:  {fn_count}")
     print(f"            Recall:           {recall:.3f}")
     print(f"            Total tool calls: {total_tool_calls}")
+    print(f"            Total tokens:     {total_tokens}")
     print(f"            Total elapsed:    {total_elapsed}s")
     print(f"            Results saved to: {results_path}")
     print("=" * 60)
@@ -323,6 +330,7 @@ def run_evaluation(redteam_path: Path = _REDTEAM_PATH) -> list[dict]:
     with open(results_path, "w") as fh:
         json.dump(
             {
+                "total_tokens": total_tokens,
                 "meta": {
                     "mode": "window",
                     "run_timestamp": run_ts,
@@ -330,6 +338,7 @@ def run_evaluation(redteam_path: Path = _REDTEAM_PATH) -> list[dict]:
                     "window_end": _FIXED_WINDOW_END,
                     "total_events": total_events,
                     "total_tool_calls": total_tool_calls,
+                    "total_tokens": total_tokens,
                     "true_positives": tp_count,
                     "false_negatives": fn_count,
                     "recall": round(recall, 4),
@@ -454,6 +463,7 @@ def run_entity_evaluation(redteam_path: str = str(_REDTEAM_PATH), sample_size: i
 
     scored_results: list[dict] = []
     total_tool_calls = 0
+    total_tokens = 0
     tp_count = 0
     tn_count = 0
     fp_count = 0
@@ -487,6 +497,7 @@ def run_entity_evaluation(redteam_path: str = str(_REDTEAM_PATH), sample_size: i
                     "verdict": "",
                     "severity": "LOW",
                     "tool_calls_made": 0,
+                    "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
                     "elapsed_seconds": 0.0,
                 }
                 print(f"           ERROR: {error}")
@@ -498,6 +509,8 @@ def run_entity_evaluation(redteam_path: str = str(_REDTEAM_PATH), sample_size: i
 
             outcome = result["outcome"]
             total_tool_calls += result.get("tool_calls_made", 0)
+            case_tokens = result.get("token_usage", {}).get("total_tokens", 0)
+            total_tokens += case_tokens
 
             if outcome == "TP":
                 tp_count += 1
@@ -509,12 +522,12 @@ def run_entity_evaluation(redteam_path: str = str(_REDTEAM_PATH), sample_size: i
                 fn_count += 1
 
             scored_results.append(result)
-            _flush_results(scored_results, _ENTITY_RESULTS_PATH)
+            _flush_results(scored_results, _ENTITY_RESULTS_PATH, total_tokens)
 
             print(
                 f"[entity_eval] Completed {len(scored_results)}/{total_cases} "
                 f"— {case['username']} → {case['dst_host']} "
-                f"({outcome}, {result.get('elapsed_seconds', 0):.1f}s)"
+                f"({outcome}, tokens={case_tokens}, {result.get('elapsed_seconds', 0):.1f}s)"
             )
 
     total_elapsed = round(time_module.monotonic() - exec_wall_start, 2)
@@ -538,6 +551,7 @@ def run_entity_evaluation(redteam_path: str = str(_REDTEAM_PATH), sample_size: i
     print(f"  Recall:           {recall:.3f}")
     print(f"  F1:               {f1:.3f}")
     print(f"  Total tool calls: {total_tool_calls}")
+    print(f"  Total tokens:     {total_tokens}")
     print(f"  Total elapsed:    {total_elapsed}s")
     print(f"  Results saved to: {_ENTITY_RESULTS_PATH}")
     print("=" * 60)
@@ -545,6 +559,7 @@ def run_entity_evaluation(redteam_path: str = str(_REDTEAM_PATH), sample_size: i
     with open(_ENTITY_RESULTS_PATH, "w") as fh:
         json.dump(
             {
+                "total_tokens": total_tokens,
                 "meta": {
                     "mode": "entity",
                     "run_timestamp": run_ts,
@@ -555,6 +570,7 @@ def run_entity_evaluation(redteam_path: str = str(_REDTEAM_PATH), sample_size: i
                     "max_concurrent": MAX_CONCURRENT_INVESTIGATIONS,
                     "total_cases": total_cases,
                     "total_tool_calls": total_tool_calls,
+                    "total_tokens": total_tokens,
                     "true_positives": tp_count,
                     "true_negatives": tn_count,
                     "false_positives": fp_count,

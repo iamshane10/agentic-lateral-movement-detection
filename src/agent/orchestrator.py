@@ -504,6 +504,7 @@ def investigate_window(start_time: int, end_time: int) -> dict:
             "verdict": "No anomalies detected in window.",
             "severity": "LOW",
             "tool_calls_made": tool_calls_made,
+            "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
     print(f"Potentially malicious users identified. Investigating...")
     # --- Phase 2: LLM Investigation ---
@@ -521,6 +522,7 @@ def investigate_window(start_time: int, end_time: int) -> dict:
     ]
 
     model = f"openai/{_NAVIGATOR_MODEL}"
+    token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
     while True:
         estimated = _estimate_tokens(messages, _PHASE2_TOOLS)
@@ -539,6 +541,11 @@ def investigate_window(start_time: int, end_time: int) -> dict:
             temperature=0,
         )
 
+        if response.usage:
+            token_usage["prompt_tokens"] += response.usage.prompt_tokens or 0
+            token_usage["completion_tokens"] += response.usage.completion_tokens or 0
+            token_usage["total_tokens"] += response.usage.total_tokens or 0
+
         choice = response.choices[0]
         assistant_message = choice.message
         messages.append(assistant_message.model_dump(exclude_none=True))
@@ -554,6 +561,7 @@ def investigate_window(start_time: int, end_time: int) -> dict:
                 "verdict": verdict_text,
                 "severity": severity,
                 "tool_calls_made": tool_calls_made,
+                "token_usage": token_usage,
             }
 
         # Execute each tool call and append results
@@ -645,6 +653,7 @@ def investigate_event(
 
     model = f"openai/{_NAVIGATOR_MODEL}"
     tool_calls_made = 0
+    token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
     while True:
         estimated = _estimate_tokens(messages, _PHASE2_TOOLS)
@@ -664,6 +673,11 @@ def investigate_event(
             temperature=0,
         )
 
+        if response.usage:
+            token_usage["prompt_tokens"] += response.usage.prompt_tokens or 0
+            token_usage["completion_tokens"] += response.usage.completion_tokens or 0
+            token_usage["total_tokens"] += response.usage.total_tokens or 0
+
         choice = response.choices[0]
         assistant_message = choice.message
         print(f"[DBG][event] finish_reason={choice.finish_reason!r}  tool_calls={len(assistant_message.tool_calls) if assistant_message.tool_calls else 0}")
@@ -674,7 +688,7 @@ def investigate_event(
             print(f"[DBG][event] LLM returned no tool calls — parsing verdict")
             verdict_text = assistant_message.content or ""
             severity, flagged_users, flagged_hosts = _parse_llm_output(verdict_text)
-            print(f"[DBG][event] DONE — severity={severity} tool_calls_made={tool_calls_made}")
+            print(f"[DBG][event] DONE — severity={severity} tool_calls_made={tool_calls_made} total_tokens={token_usage['total_tokens']}")
             return {
                 "event": {"username": username, "dst_host": dst_host, "timestamp": timestamp},
                 "flagged_users": flagged_users,
@@ -682,6 +696,7 @@ def investigate_event(
                 "verdict": verdict_text,
                 "severity": severity,
                 "tool_calls_made": tool_calls_made,
+                "token_usage": token_usage,
             }
 
         # Execute each tool call and append results

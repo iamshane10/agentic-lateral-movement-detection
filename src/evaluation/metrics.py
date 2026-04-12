@@ -61,6 +61,10 @@ def compute_agent_metrics(results: list[dict]) -> dict:
 
     unknown = sum(1 for r in results if r.get("verdict") == "UNKNOWN")
 
+    total_tokens = sum(
+        r.get("token_usage", {}).get("total_tokens", 0) for r in results
+    )
+
     return {
         "total_events": total,
         "true_positives": tp,
@@ -72,6 +76,7 @@ def compute_agent_metrics(results: list[dict]) -> dict:
         "f1_score": round(f1, 4),
         "chain_accuracy": round(chain_accuracy, 4),
         "sequence_completeness": round(sequence_completeness, 4),
+        "total_tokens": total_tokens,
     }
 
 
@@ -160,6 +165,11 @@ def print_comparison(agent: dict | None, baseline: dict | None) -> None:
             str(agent.get("unknown_verdicts", 0)),
             "N/A",
         ))
+    rows.append((
+        "Total Tokens",
+        str(agent.get("total_tokens", 0)) if agent else "—",
+        "N/A",
+    ))
 
     print()
     print("=" * 72)
