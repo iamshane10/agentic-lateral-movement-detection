@@ -15,8 +15,8 @@ import argparse
 import json
 from pathlib import Path
 
-_AGENT_RESULTS_PATH = Path("evaluation/results.json")
-_BASELINE_RESULTS_PATH = Path("evaluation/baseline_cypher_results.json")
+_AGENT_RESULTS_PATH = Path("evaluation/agent/results.json")
+_BASELINE_RESULTS_PATH = Path("evaluation/baseline/baseline_cypher_results.json")
 
 
 # ---------------------------------------------------------------------------
