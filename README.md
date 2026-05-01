@@ -1,4 +1,4 @@
-# LANL Cybersecurity Knowledge Graph - Agentic Anomaly Detection using MCP
+# Agentic Lateral Movement Detection using LANL Cybersecurity Knowledge Graph
 
 ## Steps to Run
 ### Processing the LANL Cybersecurity Dataset
