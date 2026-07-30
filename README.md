@@ -11,7 +11,7 @@
 
 ## What This Is
 
-A research system that replaces fixed detection rules with a **two-phase AI agent** that reasons over a Neo4j knowledge graph to identify lateral movement in enterprise network logs — and measures whether it outperforms a traditional static pipeline.
+A research system that replaces fixed detection rules with a **two-phase AI agent** that reasons over a Neo4j knowledge graph to identify lateral movement in enterprise network logs — and measures whether it outperforms a traditional static pipeline. You can find a video demo of the full system at http://www.youtube.com/watch?v=q-hoIrfNXVg.
 
 **Research question:** Does an LLM-orchestrated Knowledge Graph improve precision and recall of lateral movement detection compared to a static rule-based Cypher baseline?
 
