@@ -4,7 +4,7 @@
 ---
 
 > **Agent — F1: 0.747 · Recall: 0.978 · Precision: 0.605**  
-> **Baseline — F1: 0.732**  
+> **Baseline — F1: 0.732 · Recall: 1.000 · Precision: 0.577**  
 > Evaluated on 338 red-team events · 30 balanced cases × 3 runs · LANL dataset
 
 ---
