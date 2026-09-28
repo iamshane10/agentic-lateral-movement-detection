@@ -54,6 +54,7 @@ _PHASE2_TOOL_NAMES = {
     "get_lateral_movement_path",
     "get_host_centrality",
     "get_host_neighbors",
+    "get_user_historical_baseline",
 }
 
 # ---------------------------------------------------------------------------
@@ -69,6 +70,7 @@ _TOOL_DISPATCH: dict[str, callable] = {
     "get_user_timeline": investigation_server.get_user_timeline,
     "get_host_activity_summary": investigation_server.get_host_activity_summary,
     "get_concurrent_sessions": investigation_server.get_concurrent_sessions,
+    "get_user_historical_baseline": investigation_server.get_user_historical_baseline,
 }
 
 _TOOLS: list[dict] = [
@@ -80,7 +82,8 @@ _TOOLS: list[dict] = [
                 "Reconstruct the authentication chain for a user within the window. "
                 "Returns the ordered sequence of hosts the user authenticated to, "
                 "sorted chronologically. A rapid multi-host sequence (many hosts in "
-                "a short time span) is a strong lateral movement indicator."
+                "a short time span) is worth examining, but many legitimate users "
+                "authenticate to several hosts — it is not sufficient on its own."
             ),
             "parameters": {
                 "type": "object",
@@ -217,6 +220,45 @@ _TOOLS: list[dict] = [
                     },
                 },
                 "required": ["computer", "time"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_user_historical_baseline",
+            "description": (
+                "Returns the user's historical authentication baseline from before "
+                "the investigation window. Use this early in every investigation to "
+                "establish what is normal for this user. If distinct_hosts_visited is "
+                "high, multi-host activity in the window is not suspicious on its own. "
+                "If total_prior_auths is 0, this user has no history — treat all "
+                "activity as potentially anomalous. Pass dst_host (the host under "
+                "review) to get dst_host_seen_before — an exact answer to whether "
+                "the user authenticated to that host before the window "
+                "(historical_hosts is capped at 50 and may omit it). History in the "
+                "graph spans only a few hours, so avg_daily_auths is approximate."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "username": {
+                        "type": "string",
+                        "description": "LANL username (e.g. 'U456@DOM1')",
+                    },
+                    "window_start": {
+                        "type": "integer",
+                        "description": (
+                            "Investigation window start (use start_time) — LANL internal "
+                            "integer. Only successful auths before this are counted."
+                        ),
+                    },
+                    "dst_host": {
+                        "type": "string",
+                        "description": "Optional — the host under review (e.g. 'C17')",
+                    },
+                },
+                "required": ["username", "window_start"],
             },
         },
     },
@@ -367,33 +409,59 @@ def _discover_candidates(start_time: int, end_time: int) -> dict:
 # System prompt — built dynamically with Phase 1 candidates injected.
 # ---------------------------------------------------------------------------
 
-def _build_system_prompt(candidates: list[str], start_time: int, end_time: int) -> str:
+def _build_system_prompt(
+    candidates: list[str],
+    start_time: int,
+    end_time: int,
+    event_mode: bool = False,
+) -> str:
+    """
+    Build the Phase 2 system prompt.
+
+    event_mode=False (investigate_window): candidates came from Phase 1 discovery.
+    event_mode=True  (investigate_event):  a single case under review with no
+    prior flagging — framed neutrally so the model is not primed to find guilt.
+    """
     candidate_str = ", ".join(candidates)
-    return f"""You are a security investigator. You will first call discovery tools to identify suspicious entities from behavioral signals alone. Only after discovery will you investigate specific entities. Never assume who is suspicious — let the data tell you.
+    if event_mode:
+        framing = f"""Each case is a (username, host, timestamp) tuple drawn from the active network window. Your job is to determine from the evidence whether this specific authentication event is consistent with legitimate user behavior or indicative of lateral movement.
 
-Phase 1 discovery is already complete. Never call Phase 2 tools before Phase 1 is complete.
+USER UNDER REVIEW: {candidate_str}"""
+    else:
+        framing = f"""Phase 1 discovery is already complete. The following candidate users were identified from behavioral signals (high authentication failure rates, first-time authentications to new hosts, novel process executions):
 
-The following candidate users were identified from behavioral signals (high authentication failure rates, first-time authentications to new hosts, novel process executions):
+CANDIDATES: {candidate_str}"""
 
-CANDIDATES: {candidate_str}
+    return f"""You are a security investigator. Never assume who is suspicious — let the data tell you.
+
+{framing}
 
 ---
 
-PHASE 2 — INVESTIGATION
+INVESTIGATION
 
-Investigate each candidate using the available tools. Use start_time={start_time} and end_time={end_time} for all tool calls that require a time window.
+Investigate using the available tools. Use start_time={start_time} and end_time={end_time} for all tool calls that require a time window.
+
+Always call get_user_historical_baseline first (with window_start={start_time}, and dst_host set to the host under review when there is one) to establish what is normal for this user before interpreting activity in the investigation window.
 
 RULES:
-- Do not call all tools on every candidate blindly — use judgment about which tools add signal per candidate.
+- Do not call all tools blindly — use judgment about which tools add signal.
 - Do not repeat tool calls with identical parameters.
 - Time values are LANL internal integers, not Unix timestamps.
-- A rapid sequence of authentications to multiple hosts = strong lateral movement signal.
+- A rapid sequence of authentications to multiple hosts is worth examining, but on its own it is not evidence of lateral movement (see severity criteria below).
 - If a tool returns empty results, note it and move on.
 - You have a limited tool call budget. Prioritize the most informative tools.
 
 ---
 
 FINAL OUTPUT FORMAT
+
+Severity criteria:
+- HIGH: Clear evidence of lateral movement in the investigation window — the user authenticated to multiple hosts in rapid succession AND this is corroborated by other signals in the tool results (authentication to hosts absent from the user's historical baseline, a high proportion of failed authentications, process execution on a destination host shortly after authenticating to it, or a burst that departs sharply from the rest of the user's activity in the window), OR the host shows failure spikes that cannot be explained by normal activity.
+- MEDIUM: Ambiguous — some suspicious signals present but insufficient to confirm lateral movement. Requires analyst review.
+- LOW: No meaningful evidence of lateral movement. Single-host activity, low event volume, or behavior consistent with normal operations.
+
+Important: multi-host authentication alone is NOT sufficient for HIGH or MEDIUM. Many legitimate users authenticate to multiple hosts during normal operations. Elevation requires corroborating signals visible in the tool results, such as authentication to hosts absent from the user's historical baseline, a high proportion of failed authentications, process execution following an authentication, or an abrupt change in the user's activity within the window. Authenticating to a host the user has used before is weak evidence on its own. get_user_historical_baseline is the only tool that looks before the investigation window — all other tools cover the window only.
 
 After investigation, produce exactly this structure — nothing before it:
 
@@ -636,6 +704,7 @@ def investigate_event(
         candidates=[username],
         start_time=start_time,
         end_time=end_time,
+        event_mode=True,
     )
     messages: list[dict] = [
         {"role": "system", "content": system_prompt},

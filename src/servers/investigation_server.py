@@ -130,13 +130,14 @@ HOST_ACTIVITY_QUERY = """
 MATCH (c:Computer {name: $computer})
 OPTIONAL MATCH (u:User)-[a:AUTHENTICATED_TO]->(c)
 WHERE a.time >= $start_time AND a.time <= $end_time
-OPTIONAL MATCH (u2:User)-[e:EXECUTED]->(c)
-WHERE e.time >= $start_time AND e.time <= $end_time
 WITH c,
      count(DISTINCT u) as unique_auth_users,
      count(a) as total_auths,
-     sum(CASE WHEN a.status = "Success" THEN 1 ELSE 0 END) as failed_auths,
-     collect(DISTINCT u.username) as auth_users,
+     sum(CASE WHEN a.status = "Fail" THEN 1 ELSE 0 END) as failed_auths,
+     collect(DISTINCT u.username) as auth_users
+OPTIONAL MATCH (u2:User)-[e:EXECUTED]->(c)
+WHERE e.time >= $start_time AND e.time <= $end_time
+WITH c, unique_auth_users, total_auths, failed_auths, auth_users,
      count(DISTINCT u2) as unique_exec_users,
      collect(DISTINCT e.process_name) as processes_executed,
      count(e) as total_executions
@@ -276,6 +277,87 @@ def get_concurrent_sessions(computer: str, time: int, window: int = 300) -> str:
         ],
         "count": len(rows),
     })
+
+
+# ---------------------------------------------------------------------------
+# Tool 10: get_user_historical_baseline
+# ---------------------------------------------------------------------------
+
+USER_HISTORICAL_BASELINE_QUERY = """
+MATCH (u:User {username: $username})-[a:AUTHENTICATED_TO]->(c:Computer)
+WHERE a.time < $window_start
+AND a.status = 'Success'
+RETURN count(a) as total_prior_auths,
+       count(DISTINCT c) as distinct_hosts_visited,
+       collect(DISTINCT c.name)[0..50] as historical_hosts,
+       count(DISTINCT a.time / 86400) as distinct_days,
+       sum(CASE WHEN c.name = $dst_host THEN 1 ELSE 0 END) as dst_host_prior_auths
+"""
+
+
+@mcp.tool()
+def get_user_historical_baseline(
+    username: str,
+    window_start: int,
+    dst_host: str | None = None,
+) -> str:
+    """
+    Returns the user's historical authentication baseline from before the
+    investigation window. Use this early in every investigation to establish
+    what is normal for this user. If distinct_hosts_visited is high,
+    multi-host activity in the window is not suspicious on its own. If
+    total_prior_auths is 0, this user has no history — treat all activity as
+    potentially anomalous.
+
+    Days are approximated as time // 86400. LANL timestamps are elapsed
+    seconds, not Unix epoch, so this is a relative day bucket only. The graph
+    holds only a few hours of pre-window history, so distinct_days is usually
+    1-2 and avg_daily_auths is close to total_prior_auths.
+
+    historical_hosts is capped at 50, so it can omit hosts. When dst_host is
+    given, dst_host_prior_auths / dst_host_seen_before answer "has this user
+    authenticated to this host before?" exactly, regardless of the cap.
+
+    Args:
+        username:     LANL username (e.g. 'U456@DOM1')
+        window_start: Investigation window start — LANL internal integer.
+                      Only successful auths strictly before this are counted.
+        dst_host:     Optional host under review (e.g. 'C17').
+
+    Returns:
+        JSON string with total_prior_auths, distinct_hosts_visited,
+        historical_hosts (max 50), distinct_days, avg_daily_auths, and —
+        when dst_host is given — dst_host_prior_auths and dst_host_seen_before.
+    """
+    try:
+        rows = _run_query(USER_HISTORICAL_BASELINE_QUERY, {
+            "username": username,
+            "window_start": window_start,
+            "dst_host": dst_host,
+        })
+    except neo4j_exceptions.Neo4jError as exc:
+        return json.dumps({"error": str(exc), "username": username})
+
+    row = rows[0] if rows else {}
+    total_prior_auths = row.get("total_prior_auths") or 0
+    distinct_days = row.get("distinct_days") or 0
+    result = {
+        "username": username,
+        "window_start": window_start,
+        "total_prior_auths": total_prior_auths,
+        "distinct_hosts_visited": row.get("distinct_hosts_visited") or 0,
+        "historical_hosts": row.get("historical_hosts") or [],
+        "distinct_days": distinct_days,
+        "avg_daily_auths": (
+            round(total_prior_auths / distinct_days, 2) if distinct_days else 0.0
+        ),
+    }
+    if dst_host:
+        dst_prior = row.get("dst_host_prior_auths") or 0
+        result["dst_host"] = dst_host
+        result["dst_host_prior_auths"] = dst_prior
+        result["dst_host_seen_before"] = dst_prior > 0
+    return json.dumps(result)
 
 if __name__ == "__main__":
     mcp.run()

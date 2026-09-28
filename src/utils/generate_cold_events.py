@@ -9,11 +9,21 @@ no header).
 This script is run once manually and its output is committed alongside
 redteam.txt as a research artifact. It is NOT called by evaluator.py at runtime.
 
+Control sampling window: [767000, 770400].
+Control cases are drawn from the hot window period (763200–770400) rather than
+the pre-attack cold window (633600–640800). This gives control cases the same
+prior authentication history depth as red team cases: both have the entire
+cold window (633600–640800) available as prior history in Neo4j. Sampling
+controls from the cold window itself left many of them with little or no prior
+history, which biased novelty-based detectors toward false positives.
+
 Filtering pipeline:
-    Filter 1 — Exclude machine accounts ('$') and ANONYMOUS logons.
+    Filter 1 — Exclude machine accounts ('$'), ANONYMOUS logons, and Windows
+               built-in service identities ('NETWORK SERVICE', 'LOCAL SERVICE',
+               'ANONYMOUS LOGON').
     Filter 2 — Exclude any username appearing anywhere in redteam.txt.
     Filter 3 — Low-centrality hosts only (< 50 distinct authenticating users
-               in the cold window).
+               in the control sampling window).
     Filter 4 — Exclude rapid multi-hop users (> 3 distinct hosts in any 300s
                sliding window). Bulk query; skipped with a warning on timeout.
     Filter 5 — Successful authentications only (a.status = 'Success').
@@ -23,7 +33,7 @@ both src_host and dst_host columns, consistent with how evaluator.py uses
 only username, dst_host, and timestamp from each row.
 
 Usage:
-    uv run python -m src.evaluation.generate_cold_events
+    uv run python -m src.utils.generate_cold_events
 """
 
 import os
@@ -32,7 +42,7 @@ import sys
 from pathlib import Path
 
 # Ensure project root is on sys.path when run directly as a script.
-# Has no effect when invoked via `python -m src.evaluation.generate_cold_events`.
+# Has no effect when invoked via `python -m src.utils.generate_cold_events`.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from dotenv import load_dotenv
@@ -40,18 +50,27 @@ from neo4j import GraphDatabase
 
 load_dotenv()
 
-COLD_WINDOW_START = 635020
-COLD_WINDOW_END   = 640800
+# Control sampling window — inside the hot window period so control cases have
+# the same prior history depth (full cold window 633600–640800) as red team cases.
+COLD_WINDOW_START = 767000
+COLD_WINDOW_END   = 770400
+
+# Hot window — used only to count red team events so the control set matches 1:1
+_HOT_WINDOW_START = 763200
+_HOT_WINDOW_END   = 770400
 
 _REDTEAM_PATH = Path(os.getenv("REDTEAM_PATH", "data/redteam.txt"))
 _OUTPUT_PATH  = Path("data/cold_events.txt")
 
-# Filter 3 — low-centrality hosts in the cold window (< 50 distinct users)
+# Filter 3 — low-centrality hosts in the control sampling window (< 50 distinct users)
 _LOW_CENTRALITY_QUERY = """
 MATCH (u:User)-[a:AUTHENTICATED_TO]->(c:Computer)
-WHERE a.time >= 635020 AND a.time <= 640800
+WHERE a.time >= 767000 AND a.time <= 770400
 AND NOT u.username CONTAINS '$'
 AND NOT u.username CONTAINS 'ANONYMOUS'
+AND NOT u.username CONTAINS 'NETWORK SERVICE'
+AND NOT u.username CONTAINS 'LOCAL SERVICE'
+AND NOT u.username CONTAINS 'ANONYMOUS LOGON'
 WITH c, count(DISTINCT u) AS unique_users
 WHERE unique_users < 50
 RETURN c.name AS computer, unique_users
@@ -62,10 +81,13 @@ ORDER BY unique_users ASC
 # (bulk query; skipped gracefully on timeout)
 _HIGH_HOP_QUERY = """
 MATCH (u:User)-[a:AUTHENTICATED_TO]->(c:Computer)
-WHERE a.time >= 635020 AND a.time <= 640800
+WHERE a.time >= 767000 AND a.time <= 770400
 AND a.status = 'Success'
 AND NOT u.username CONTAINS '$'
 AND NOT u.username CONTAINS 'ANONYMOUS'
+AND NOT u.username CONTAINS 'NETWORK SERVICE'
+AND NOT u.username CONTAINS 'LOCAL SERVICE'
+AND NOT u.username CONTAINS 'ANONYMOUS LOGON'
 WITH u, a.time AS t
 MATCH (u)-[a2:AUTHENTICATED_TO]->(c2:Computer)
 WHERE a2.time >= t AND a2.time <= t + 300
@@ -76,19 +98,22 @@ WHERE max_hops > 3
 RETURN DISTINCT u.username AS username
 """
 
-# Candidate events on low-centrality hosts in the cold window
+# Candidate events on low-centrality hosts in the control sampling window
 _CANDIDATE_QUERY = """
 MATCH (u:User)-[a:AUTHENTICATED_TO]->(c:Computer)
-WHERE a.time >= 635020 AND a.time <= 640800
+WHERE a.time >= 767000 AND a.time <= 770400
 AND a.status = 'Success'
 AND NOT u.username CONTAINS '$'
 AND NOT u.username CONTAINS 'ANONYMOUS'
+AND NOT u.username CONTAINS 'NETWORK SERVICE'
+AND NOT u.username CONTAINS 'LOCAL SERVICE'
+AND NOT u.username CONTAINS 'ANONYMOUS LOGON'
 AND c.name IN $low_centrality_hosts
 RETURN u.username AS username,
        c.name AS dst_host,
        a.time AS timestamp
 ORDER BY rand()
-LIMIT 1000
+LIMIT 5000
 """
 
 
@@ -109,12 +134,28 @@ def _load_redteam_usernames(path: Path) -> set[str]:
     return usernames
 
 
+def _count_hot_window_redteam_events(path: Path) -> int:
+    """Return the number of redteam.txt events inside the hot window."""
+    count = 0
+    if not path.exists():
+        return count
+    with open(path, "r") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(",")
+            if len(parts) >= 4 and _HOT_WINDOW_START <= int(parts[0]) <= _HOT_WINDOW_END:
+                count += 1
+    return count
+
+
 def main() -> None:
     neo4j_uri      = os.getenv("NEO4J_URI", "bolt://localhost:7687")
     neo4j_user_env = os.getenv("NEO4J_USER", "neo4j")
     neo4j_password = os.getenv("NEO4J_PASSWORD", "password")
 
-    print(f"[cold_events] Cold window: {COLD_WINDOW_START} to {COLD_WINDOW_END}")
+    print(f"[cold_events] Control window: {COLD_WINDOW_START} to {COLD_WINDOW_END}")
 
     # Filter 2: collect redteam usernames for exclusion
     redteam_usernames = _load_redteam_usernames(_REDTEAM_PATH)
@@ -166,10 +207,17 @@ def main() -> None:
             seen_users.add(c["username"])
             deduped.append(c)
 
-    # Take first 50 after deduplication
-    final_events = deduped[:50]
+    # One control per hot-window red team event, so evaluation can be balanced 1:1
+    n_target = _count_hot_window_redteam_events(_REDTEAM_PATH)
+    final_events = deduped[:n_target]
+    if len(final_events) < n_target:
+        print(
+            f"[cold_events] Warning: only {len(final_events)} control events available, "
+            f"target was {n_target}"
+        )
 
     print(f"[cold_events] Redteam users excluded:        {len(redteam_usernames)}")
+    print(f"[cold_events] Target (hot-window redteam):   {n_target}")
     print(f"[cold_events] Final cold events written:     {len(final_events)}")
 
     # Write output — src_host = dst_host (no origin concept for cold events)

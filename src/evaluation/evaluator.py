@@ -33,7 +33,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import json
 import os
-import random
 import time as time_module
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -46,6 +45,7 @@ from src.agent.orchestrator import investigate_event, investigate_window
 load_dotenv()
 
 _REDTEAM_PATH = Path(os.getenv("REDTEAM_PATH", "data/redteam.txt"))
+_EVAL_CASES_PATH = Path("data/eval_cases.txt")
 _WINDOW_SIZE = 7200  # 2 hours in LANL internal integer seconds
 _FIXED_WINDOW_START = 763200
 _FIXED_WINDOW_END = 764600
@@ -84,6 +84,59 @@ def _parse_redteam(path: Path) -> list[dict]:
                 "dst_host": parts[3].strip(),
             })
     return events
+
+
+def _load_eval_cases(
+    path: Path,
+    sample_size: int | None,
+    split: str | None = None,
+) -> list[dict]:
+    """
+    Load the fixed evaluation case list (generate_eval_cases.py output).
+
+    Every evaluator reads the same file, so all methods score identical cases.
+    If split is given ('tune' or 'test'), keeps only that half of the file.
+    If sample_size is given, keeps the first N redteam and first N control
+    cases in file order (the file is pre-shuffled with a fixed seed).
+    """
+    if not path.exists():
+        raise FileNotFoundError(
+            f"eval_cases.txt not found at {path}. "
+            "Run: uv run python -m src.utils.generate_eval_cases"
+        )
+    all_cases: list[dict] = []
+    with open(path, "r") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [p.strip() for p in line.split(",")]
+            ts, username, src_host, dst_host, label = parts[:5]
+            all_cases.append({
+                "timestamp":  int(ts),
+                "username":   username,
+                "src_host":   src_host,
+                "dst_host":   dst_host,
+                "is_redteam": label == "redteam",
+                "split":      parts[5] if len(parts) > 5 else None,
+            })
+
+    if split is not None:
+        all_cases = [c for c in all_cases if c["split"] == split]
+
+    n_redteam = sum(c["is_redteam"] for c in all_cases)
+    n_control = len(all_cases) - n_redteam
+    n = min(n_redteam, n_control)
+    if sample_size is not None:
+        n = min(n, sample_size)
+
+    cases: list[dict] = []
+    taken = {True: 0, False: 0}
+    for c in all_cases:
+        if taken[c["is_redteam"]] < n:
+            cases.append(c)
+            taken[c["is_redteam"]] += 1
+    return cases
 
 
 # ---------------------------------------------------------------------------
@@ -353,102 +406,45 @@ def run_evaluation(redteam_path: Path = _REDTEAM_PATH) -> list[dict]:
     return event_results
 
 
-def run_entity_evaluation(redteam_path: str = str(_REDTEAM_PATH), sample_size: int = 12) -> None:
+def run_entity_evaluation(
+    cases_path: str = str(_EVAL_CASES_PATH),
+    sample_size: int | None = None,
+    split: str | None = None,
+) -> None:
     """
-    Entity-seeded pilot evaluation against redteam.txt ground truth.
+    Entity-seeded evaluation against ground truth.
 
-    Builds a balanced set of true positive (red team) and false positive
-    (control) cases, runs investigate_event() on each, and scores results.
+    Loads the fixed balanced case list from data/eval_cases.txt
+    (generate_eval_cases.py output) — the same file every baseline reads — runs
+    investigate_event() on each case, and scores results. The agent receives
+    only (username, dst_host, timestamp); labels are used for scoring only.
     Writes incrementally to a timestamped evaluation/entity_results_*.json file.
 
     Args:
-        redteam_path: Path to redteam.txt (default: REDTEAM_PATH env var)
-        sample_size:  Max number of red team events to use as TP cases
+        cases_path:  Path to eval_cases.txt
+        sample_size: Use only the first N redteam and N control cases (default: all)
+        split:       'tune' or 'test' to use only that half (default: all cases)
     """
     run_ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    _ENTITY_RESULTS_PATH = Path(f"evaluation/entity_results_{run_ts}.json")
+    split_tag = f"{split}_" if split else ""
+    _ENTITY_RESULTS_PATH = Path(f"evaluation/entity_results_{split_tag}{run_ts}.json")
     _ENTITY_RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     eval_wall_start = time_module.monotonic()
 
     HOT_WINDOW_START  = 763200
     HOT_WINDOW_END    = 770400
-    COLD_WINDOW_START = 633600  # matches generate_cold_events.py — for meta logging only
-    COLD_WINDOW_END   = 640800
+    COLD_WINDOW_START = 767000  # control sampling window — matches generate_cold_events.py; for meta logging only
+    COLD_WINDOW_END   = 770400
 
-    # --- Step 1: Load red team cases from hot window ---
-    all_rt_events = _parse_redteam(Path(redteam_path))
-    print(f"[DBG][entity_eval] redteam_path={redteam_path!r}")
-    print(f"[DBG][entity_eval] total events in redteam.txt: {len(all_rt_events)}")
-    if all_rt_events:
-        ts_all = [e["timestamp"] for e in all_rt_events]
-        print(f"[DBG][entity_eval] redteam timestamp range: [{min(ts_all)}, {max(ts_all)}]")
-
-    hot_rt_events = [
-        e for e in all_rt_events
-        if HOT_WINDOW_START <= e["timestamp"] <= HOT_WINDOW_END
-    ]
-    print(f"[DBG][entity_eval] events in hot window [{HOT_WINDOW_START}, {HOT_WINDOW_END}]: {len(hot_rt_events)}")
-    for e in hot_rt_events:
-        print(f"[DBG][entity_eval]   redteam event: time={e['timestamp']} user={e['username']!r} src={e['src_host']!r} dst={e['dst_host']!r}")
-
-    random.shuffle(hot_rt_events)
-    tp_events = hot_rt_events[:sample_size]
-    n_redteam = len(tp_events)
-    print(f"[DBG][entity_eval] TP cases selected ({n_redteam}):")
-    for e in tp_events:
-        print(f"[DBG][entity_eval]   TP: time={e['timestamp']} user={e['username']!r} dst={e['dst_host']!r}")
-
-    # Collect all redteam usernames (whole file) for control exclusion — Step 4
-    redteam_usernames: set[str] = {e["username"] for e in all_rt_events}
-    print(f"[DBG][entity_eval] total distinct redteam usernames (all time): {len(redteam_usernames)}")
-
-    # --- Step 2: Load control cases from cold_events.txt ---
-    # cold_events.txt is generated once by src/evaluation/generate_cold_events.py
-    # and committed as a research artifact. The evaluator never queries Neo4j
-    # for control sampling at runtime.
-    _COLD_EVENTS_PATH = Path("data/cold_events.txt")
-    if not _COLD_EVENTS_PATH.exists():
-        raise FileNotFoundError(
-            f"cold_events.txt not found at {_COLD_EVENTS_PATH}. "
-            "Run: uv run python -m src.evaluation.generate_cold_events"
-        )
-    cold_all = _parse_redteam(_COLD_EVENTS_PATH)
-    cold_all = [e for e in cold_all if e["username"] not in redteam_usernames]
-    random.shuffle(cold_all)
-    clean_controls = cold_all[:sample_size]
-    print(f"[DBG][entity_eval] cold_events.txt: {len(cold_all)} rows after redteam exclusion")
-    if len(clean_controls) < n_redteam:
-        print(
-            f"[entity_eval] Warning: only {len(clean_controls)} control events available "
-            f"in cold_events.txt, requested {n_redteam}"
-        )
-
-    # Step 5: balance — equal red team and control cases
-    n_cases = min(n_redteam, len(clean_controls))
-    final_redteam  = tp_events[:n_cases]
-    final_controls = clean_controls[:n_cases]
-
-    cases: list[dict] = []
-    for event in final_redteam:
-        cases.append({
-            "username": event["username"],
-            "dst_host": event["dst_host"],
-            "timestamp": event["timestamp"],
-            "is_redteam": True,
-        })
-    for control in final_controls:
-        cases.append({
-            "username": control["username"],
-            "dst_host": control["dst_host"],
-            "timestamp": control["timestamp"],
-            "is_redteam": False,
-        })
-    random.shuffle(cases)
+    # --- Load the fixed, pre-shuffled case list (shared with all baselines) ---
+    cases = _load_eval_cases(Path(cases_path), sample_size, split)
+    n_cases = sum(c["is_redteam"] for c in cases)
 
     total_cases = len(cases)
-    print(f"[entity_eval] Hot window red team cases:  {len(final_redteam)}")
-    print(f"[entity_eval] Cold window control cases:  {len(final_controls)}")
+    print(f"[entity_eval] cases_path={cases_path!r} split={split or 'all'}")
+    print(f"[entity_eval] Red team cases:             {n_cases}")
+    print(f"[entity_eval] Control cases:              {n_cases}")
     print(f"[entity_eval] Total cases to evaluate:    {total_cases}")
     print(f"[entity_eval] Results → {_ENTITY_RESULTS_PATH}\n")
 
@@ -562,6 +558,7 @@ def run_entity_evaluation(redteam_path: str = str(_REDTEAM_PATH), sample_size: i
                 "total_tokens": total_tokens,
                 "meta": {
                     "mode": "entity",
+                    "split": split or "all",
                     "run_timestamp": run_ts,
                     "hot_window_start": HOT_WINDOW_START,
                     "hot_window_end": HOT_WINDOW_END,
@@ -612,12 +609,20 @@ modes:
     parser.add_argument(
         "--sample-size",
         type=int,
-        default=12,
-        help="[entity mode only] Max number of redteam TP cases to evaluate (default: 12)",
+        default=None,
+        help="[entity mode only] Use only the first N redteam and N control cases "
+             "from data/eval_cases.txt (default: all)",
+    )
+    parser.add_argument(
+        "--split",
+        choices=["tune", "test"],
+        default=None,
+        help="[entity mode only] Use only the tune or test half of data/eval_cases.txt "
+             "(default: all cases)",
     )
     args = parser.parse_args()
 
     if args.mode == "window":
         run_evaluation()
     else:
-        run_entity_evaluation(sample_size=args.sample_size)
+        run_entity_evaluation(sample_size=args.sample_size, split=args.split)

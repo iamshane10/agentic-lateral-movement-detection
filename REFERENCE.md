@@ -25,7 +25,7 @@ The core claim is that a two-phase AI agent, reasoning over a graph schema, can 
 - `redteam.txt` is the evaluation oracle only. It is never loaded into Neo4j and never exposed to the agent.
 - Behavioral anomaly detection is the sole detection mechanism — patterns over time, not named software or CVEs.
 - The agent investigates blind: it receives no entity identities as inputs in `investigate_window()`, and receives no label in `investigate_event()`.
-- Two time windows are used: a **hot window** `[763200, 770400]` containing confirmed red team events (TP cases), and a **cold window** `[633600, 640800]` (pre-attack, no red team activity) used for control cases.
+- Two time windows are used: a **hot window** `[763200, 770400]` containing confirmed red team events (TP cases), and a **cold window** `[633600, 640800]` (pre-attack, no red team activity) that provides prior authentication history. Control cases are sampled from `[767000, 770400]` (inside the hot window period) so they have the same prior history depth as red team cases.
 
 ---
 
@@ -69,6 +69,7 @@ cis6930sp26-project/
 │   ├── authentications.csv         # ETL output — Neo4j relationship import
 │   ├── process_events.csv          # ETL output — Neo4j relationship import
 │   ├── cold_events.txt             # Control cases (generate_cold_events.py output)
+│   ├── eval_cases.txt              # Fixed balanced case list (generate_eval_cases.py output) — grading file
 │   └── redteam.txt                 # Ground truth — NEVER load into Neo4j
 ├── src/
 │   ├── pipeline/
@@ -104,7 +105,7 @@ Reads raw LANL `auth.txt` and `proc.txt` via DuckDB in-memory, filters to two ti
 | Window | Start | End | Purpose |
 |--------|-------|-----|---------|
 | Hot (attack) | 763200 | 770400 | Contains confirmed red team events — TP cases |
-| Cold (control) | 633600 | 640800 | Pre-attack quiet period — control/FP cases |
+| Cold (history) | 633600 | 640800 | Pre-attack quiet period — prior history for all cases |
 
 Both windows are retained in the exported CSVs. The ETL is a union filter:
 ```sql
@@ -176,6 +177,7 @@ _TOOL_DISPATCH = {
     "get_user_timeline":         investigation_server.get_user_timeline,
     "get_host_activity_summary": investigation_server.get_host_activity_summary,
     "get_concurrent_sessions":   investigation_server.get_concurrent_sessions,
+    "get_user_historical_baseline": investigation_server.get_user_historical_baseline,
 }
 ```
 
@@ -199,7 +201,7 @@ MATCH (u:User {username: $username})-[a:AUTHENTICATED_TO]->(c:Computer)
 WHERE a.time >= $start_time AND a.time <= $end_time
 WITH u,
      count(a) as total_attempts,
-     sum(CASE WHEN a.status = "Success" THEN 1 ELSE 0 END) as failed_attempts,
+     sum(CASE WHEN a.status = "Fail" THEN 1 ELSE 0 END) as failed_attempts,
      collect(DISTINCT c.name) as target_computers,
      collect(DISTINCT a.auth_type) as auth_types_used
 RETURN u.username as username,
@@ -407,13 +409,14 @@ RETURN u.username as username,
 MATCH (c:Computer {name: $computer})
 OPTIONAL MATCH (u:User)-[a:AUTHENTICATED_TO]->(c)
 WHERE a.time >= $start_time AND a.time <= $end_time
-OPTIONAL MATCH (u2:User)-[e:EXECUTED]->(c)
-WHERE e.time >= $start_time AND e.time <= $end_time
 WITH c,
      count(DISTINCT u) as unique_auth_users,
      count(a) as total_auths,
-     sum(CASE WHEN a.status = "Success" THEN 1 ELSE 0 END) as failed_auths,
-     collect(DISTINCT u.username) as auth_users,
+     sum(CASE WHEN a.status = "Fail" THEN 1 ELSE 0 END) as failed_auths,
+     collect(DISTINCT u.username) as auth_users
+OPTIONAL MATCH (u2:User)-[e:EXECUTED]->(c)
+WHERE e.time >= $start_time AND e.time <= $end_time
+WITH c, unique_auth_users, total_auths, failed_auths, auth_users,
      count(DISTINCT u2) as unique_exec_users,
      collect(DISTINCT e.process_name) as processes_executed,
      count(e) as total_executions
@@ -426,6 +429,8 @@ RETURN c.name as computer,
        processes_executed,
        total_executions
 ```
+
+Auth events are aggregated to a single row before process events are matched, so the two `OPTIONAL MATCH` clauses do not form a Cartesian product.
 
 ---
 
@@ -449,6 +454,33 @@ ORDER BY time_delta_from_event ASC
 ```
 
 **Signal:** Multiple users authenticating to the same host within seconds of a red team event indicates either a coordinated attack or a high-value shared resource. Use `window=300`.
+
+---
+
+#### Tool 10: `get_user_historical_baseline`
+
+**Purpose:** Gives the agent the user's authentication history from **before** the investigation window, so it can judge what is normal for this user. The only Phase 2 tool that looks outside the window.
+
+**Input:** `username: str`, `window_start: int` (pass the investigation `start_time`), `dst_host: str | None = None`
+
+**Cypher:**
+```cypher
+MATCH (u:User {username: $username})-[a:AUTHENTICATED_TO]->(c:Computer)
+WHERE a.time < $window_start
+AND a.status = 'Success'
+RETURN count(a) as total_prior_auths,
+       count(DISTINCT c) as distinct_hosts_visited,
+       collect(DISTINCT c.name)[0..50] as historical_hosts,
+       count(DISTINCT a.time / 86400) as distinct_days,
+       sum(CASE WHEN c.name = $dst_host THEN 1 ELSE 0 END) as dst_host_prior_auths
+```
+
+**Returns:** `total_prior_auths`, `distinct_hosts_visited`, `historical_hosts` (max 50), `distinct_days`, `avg_daily_auths` (`total_prior_auths / distinct_days`), and — when `dst_host` is given — `dst_host_prior_auths` and `dst_host_seen_before`.
+
+**Notes:**
+- `dst_host_seen_before` answers "has this user logged into this host before the window?" exactly; `historical_hosts` is capped at 50 and can omit the host.
+- History in the graph is the cold window plus the part of the hot window before `window_start`. Days are `time // 86400` (LANL elapsed seconds, not epoch), so `distinct_days` is usually 1–2 and `avg_daily_auths` is approximate.
+- For red team users, "history" includes their own earlier attack activity in the hot window — the same limitation the UA baseline has.
 
 ---
 
@@ -534,6 +566,7 @@ LIMIT 20
 | `get_user_timeline` | `investigation_server.py` | `username`, `start_time`, `end_time` |
 | `get_host_activity_summary` | `investigation_server.py` | `computer`, `start_time`, `end_time` |
 | `get_concurrent_sessions` | `investigation_server.py` | `computer`, `time`, `window=300` |
+| `get_user_historical_baseline` | `investigation_server.py` | `username`, `window_start`, `dst_host` (optional) |
 
 Behavioral tools (`get_auth_anomalies`, `get_first_time_authentications`, `get_process_anomalies`) are **not** exposed to the LLM. `get_host_neighbors` is excluded (disabled).
 
@@ -550,38 +583,50 @@ Behavioral tools (`get_auth_anomalies`, `get_first_time_authentications`, `get_p
 
 ### 6.4 System Prompt (Dynamic)
 
-Built at runtime by `_build_system_prompt(candidates, start_time, end_time)`. No separate `system_prompt.py` file.
+Built at runtime by `_build_system_prompt(candidates, start_time, end_time, event_mode=False)`. No separate `system_prompt.py` file. The severity criteria only reference signals the Phase 2 tools can observe. `get_user_historical_baseline` is the only tool that looks before the investigation window; all others cover the window only. The framing block depends on the entry point:
+
+- `investigate_window()` (`event_mode=False`): candidates came from Phase 1, so the prompt says so and lists them as `CANDIDATES:`.
+- `investigate_event()` (`event_mode=True`): neutral framing — the case has not been pre-flagged, so the prompt must not claim it was. Listed as `USER UNDER REVIEW:`.
 
 ```
-You are a security investigator. You will first call discovery tools to identify
-suspicious entities from behavioral signals alone. Only after discovery will you
-investigate specific entities. Never assume who is suspicious — let the data tell you.
+You are a security investigator. Never assume who is suspicious — let the data tell you.
 
-Phase 1 discovery is already complete. Never call Phase 2 tools before Phase 1 is complete.
+[event_mode=True]
+Each case is a (username, host, timestamp) tuple drawn from the active network window. Your job is to determine from the evidence whether this specific authentication event is consistent with legitimate user behavior or indicative of lateral movement.
 
-The following candidate users were identified from behavioral signals (high authentication
-failure rates, first-time authentications to new hosts, novel process executions):
+USER UNDER REVIEW: {candidate_str}
+
+[event_mode=False]
+Phase 1 discovery is already complete. The following candidate users were identified from behavioral signals (high authentication failure rates, first-time authentications to new hosts, novel process executions):
 
 CANDIDATES: {candidate_str}
 
 ---
 
-PHASE 2 — INVESTIGATION
+INVESTIGATION
 
-Investigate each candidate using the available tools. Use start_time={start_time} and
-end_time={end_time} for all tool calls that require a time window.
+Investigate using the available tools. Use start_time={start_time} and end_time={end_time} for all tool calls that require a time window.
+
+Always call get_user_historical_baseline first (with window_start={start_time}, and dst_host set to the host under review when there is one) to establish what is normal for this user before interpreting activity in the investigation window.
 
 RULES:
-- Do not call all tools on every candidate blindly — use judgment about which tools add signal.
+- Do not call all tools blindly — use judgment about which tools add signal.
 - Do not repeat tool calls with identical parameters.
 - Time values are LANL internal integers, not Unix timestamps.
-- A rapid sequence of authentications to multiple hosts = strong lateral movement signal.
+- A rapid sequence of authentications to multiple hosts is worth examining, but on its own it is not evidence of lateral movement (see severity criteria below).
 - If a tool returns empty results, note it and move on.
 - You have a limited tool call budget. Prioritize the most informative tools.
 
 ---
 
 FINAL OUTPUT FORMAT
+
+Severity criteria:
+- HIGH: Clear evidence of lateral movement in the investigation window — the user authenticated to multiple hosts in rapid succession AND this is corroborated by other signals in the tool results (authentication to hosts absent from the user's historical baseline, a high proportion of failed authentications, process execution on a destination host shortly after authenticating to it, or a burst that departs sharply from the rest of the user's activity in the window), OR the host shows failure spikes that cannot be explained by normal activity.
+- MEDIUM: Ambiguous — some suspicious signals present but insufficient to confirm lateral movement. Requires analyst review.
+- LOW: No meaningful evidence of lateral movement. Single-host activity, low event volume, or behavior consistent with normal operations.
+
+Important: multi-host authentication alone is NOT sufficient for HIGH or MEDIUM. Many legitimate users authenticate to multiple hosts during normal operations. Elevation requires corroborating signals visible in the tool results, such as authentication to hosts absent from the user's historical baseline, a high proportion of failed authentications, process execution following an authentication, or an abrupt change in the user's activity within the window. Authenticating to a host the user has used before is weak evidence on its own. get_user_historical_baseline is the only tool that looks before the investigation window — all other tools cover the window only.
 
 After investigation, produce exactly this structure — nothing before it:
 
@@ -632,26 +677,43 @@ Builds a `±3600s` window around `timestamp`, injects the single username as the
 
 ---
 
-## 7. Control Case Generation (`src/evaluation/generate_cold_events.py`)
+## 7. Control Case Generation (`src/utils/generate_cold_events.py`)
 
 **Purpose:** One-time data preparation script. Generates `data/cold_events.txt` — a curated set of clean control (non-red-team) authentication events from the cold window. This file is committed as a research artifact. The evaluator loads from it at runtime and **does not** query Neo4j for control sampling.
 
-**Cold window:** `[635020, 640800]`
+**Control sampling window:** `[767000, 770400]` — inside the hot window period, so control cases have the full cold window (633600–640800) as prior history, the same as red team cases. (Previously `[635020, 640800]`, which left many controls with little or no prior history; that set is kept as `data/cold_events_old.txt`.)
 
 **Filtering pipeline (5 filters):**
-1. **Filter 1:** Exclude machine accounts (`$`) and ANONYMOUS logons
+1. **Filter 1:** Exclude machine accounts (`$`), ANONYMOUS logons, and Windows built-in service identities (`NETWORK SERVICE`, `LOCAL SERVICE`, `ANONYMOUS LOGON`)
 2. **Filter 2:** Exclude any username appearing anywhere in `redteam.txt` (whole file)
-3. **Filter 3:** Low-centrality hosts only (`< 50` distinct authenticating users in the cold window)
+3. **Filter 3:** Low-centrality hosts only (`< 50` distinct authenticating users in the control sampling window)
 4. **Filter 4:** Exclude rapid multi-hop users (`> 3` distinct hosts in any 300s sliding window). Bulk query — skipped gracefully on timeout.
 5. **Filter 5:** Successful authentications only (`a.status = 'Success'`)
 
 **Output format:** Same as `redteam.txt`: `timestamp,username,src_host,dst_host` (no header, one event per line). Since cold events have no origin concept, `src_host = dst_host`.
 
-**Deduplication:** One event per unique username. Capped at 50 final events.
+**Deduplication:** One event per unique username. Capped at the number of hot-window red team events (93), so evaluation can be balanced 1:1. The candidate query samples up to 5000 random events before deduplication.
 
 **Usage:**
 ```bash
-uv run python -m src.evaluation.generate_cold_events
+uv run python -m src.utils.generate_cold_events
+```
+
+### 7.1 Fixed Evaluation Case List (`src/utils/generate_eval_cases.py`)
+
+Builds `data/eval_cases.txt`, the single case list read by `evaluator.py` entity mode **and** every baseline, so all methods score exactly the same cases.
+
+- Red team cases: every `redteam.txt` event in the hot window `[763200, 770400]` (93 events, from 17 distinct users).
+- Control cases: every event in `data/cold_events.txt` (93 events, 93 distinct users).
+- Balanced 1:1 at the largest size available (currently 93 + 93 = 186 cases).
+- Order shuffled with a fixed seed (`SEED = 42`). `--sample-size N` on any evaluator keeps the first N red team and first N control cases in file order — a reproducible random subset.
+- **Tune / test split:** each label is split in half by file order — 46 red team + 46 control in `tune`, 47 + 47 in `test`. Adjust the agent's prompt using `--split tune` only; report final numbers from `--split test`, so they are not tuned to the cases they are measured on. Red team events are split at the event level, so most red team users appear in both halves (14 of 17 in each).
+- Format: `timestamp,username,src_host,dst_host,label,split` (`label` = `redteam` or `control`, `split` = `tune` or `test`; `#` lines are comments).
+- Contains ground-truth labels: a grading file like `redteam.txt`. Evaluators pass only `(username, dst_host, timestamp)` to the agent.
+
+Regenerate only after `cold_events.txt` changes:
+```bash
+uv run python -m src.utils.generate_eval_cases
 ```
 
 ---
@@ -679,15 +741,17 @@ uv run python -m src.evaluation.evaluator --mode window
 ### 8.2 Entity Mode (precision + recall + F1)
 
 ```bash
-uv run python -m src.evaluation.evaluator --mode entity --sample-size 12
+uv run python -m src.evaluation.evaluator --mode entity                  # all 186 cases
+uv run python -m src.evaluation.evaluator --mode entity --split tune     # tuning half (92 cases)
+uv run python -m src.evaluation.evaluator --mode entity --split test     # held-out half (94 cases)
+uv run python -m src.evaluation.evaluator --mode entity --sample-size 15 # first 15 + 15
 ```
 
 **Stage 1 — Case construction:**
-- Parse `redteam.txt`. Filter to hot window `[763200, 770400]`.
-- Shuffle and cap at `--sample-size` (default 12) → TP cases.
-- Load control cases from `data/cold_events.txt`. Exclude any username appearing in `redteam.txt` (whole file).
-- Balance: `min(len(tp_cases), len(control_cases))` of each.
-- Shuffle combined case list.
+- Load the fixed case list from `data/eval_cases.txt` (see §7.1). No random sampling at runtime.
+- `--split tune|test` (optional) keeps only that half; output file becomes `entity_results_{split}_YYYYMMDD_HHMMSS.json`.
+- `--sample-size N` (optional) keeps the first N red team and first N control cases (within the split, if given); default is all.
+- All baselines accept the same `--split` and `--sample-size` flags; with `--split`, their output file gets a `_{split}` suffix (e.g. `ua_baseline_results_test.json`).
 
 **Stage 2 — Concurrent investigation:**
 - Run `investigate_event()` on all cases via `ThreadPoolExecutor(max_workers=3)`.
@@ -715,8 +779,8 @@ Output: `evaluation/entity_results_YYYYMMDD_HHMMSS.json`
     "run_timestamp": "YYYYMMDD_HHMMSS",
     "hot_window_start": 763200,
     "hot_window_end": 770400,
-    "cold_window_start": 633600,
-    "cold_window_end": 640800,
+    "cold_window_start": 767000,
+    "cold_window_end": 770400,
     "max_concurrent": 3,
     "total_cases": int,
     "total_tool_calls": int,
@@ -737,7 +801,7 @@ Output: `evaluation/entity_results_YYYYMMDD_HHMMSS.json`
 
 ## 9. Baseline Evaluator (`src/evaluation/baseline_evaluator.py`)
 
-Static, deterministic, rule-based detector. No LLM. No tool calls. Serves as the comparison baseline against the agent. Runs the same balanced case structure as entity mode.
+Static, deterministic, rule-based detector. No LLM. No tool calls. Serves as the comparison baseline against the agent. Reads the same `data/eval_cases.txt` case list as entity mode, so it scores exactly the same cases.
 
 ### 9.1 Three-Signal Scoring
 
@@ -807,7 +871,7 @@ RETURN count(DISTINCT c) AS distinct_hosts
 
 ### 9.2 Running the Baseline
 ```bash
-uv run python -m src.evaluation.baseline_evaluator --sample-size 12
+uv run python -m src.evaluation.baseline_evaluator
 ```
 Output: `evaluation/baseline_results.json`
 
@@ -856,7 +920,7 @@ Follow this exact order. Do not begin the orchestrator until all MCP servers are
 | 4 | Build `topology_server.py` — test `get_host_centrality` and `get_lateral_movement_path`. |
 | 5 | Build `investigation_server.py` — test all three tools. |
 | 6 | Build `orchestrator.py` — Phase 1 + Phase 2. Test: `investigate_window(763200, 770000)`. |
-| 7 | Generate control cases: `uv run python -m src.evaluation.generate_cold_events`. Verify `data/cold_events.txt`. |
+| 7 | Generate control cases: `uv run python -m src.utils.generate_cold_events`, then the fixed case list: `uv run python -m src.utils.generate_eval_cases`. Verify `data/cold_events.txt` and `data/eval_cases.txt`. |
 | 8 | Build `evaluator.py` — test window mode first, then entity mode. |
 | 9 | Build `baseline_evaluator.py` — run same sample against static signals. |
 | 10 | Run `metrics.py` to generate comparison table. |
@@ -872,8 +936,9 @@ uv sync
 # Run ETL
 uv run python -m src.pipeline.etl
 
-# Generate control cases (run once)
-uv run python -m src.evaluation.generate_cold_events
+# Generate control cases, then the fixed evaluation case list (run once)
+uv run python -m src.utils.generate_cold_events
+uv run python -m src.utils.generate_eval_cases
 
 # Run agent manually
 uv run python src/agent/orchestrator.py
@@ -881,11 +946,15 @@ uv run python src/agent/orchestrator.py
 # Run evaluation — window mode (recall only)
 uv run python -m src.evaluation.evaluator --mode window
 
-# Run evaluation — entity mode (precision + recall + F1)
-uv run python -m src.evaluation.evaluator --mode entity --sample-size 12
+# Run evaluation — entity mode (precision + recall + F1), all cases in data/eval_cases.txt
+uv run python -m src.evaluation.evaluator --mode entity
+# ...or only the held-out half, for final reported numbers (add --split test to baselines too)
+uv run python -m src.evaluation.evaluator --mode entity --split test
 
-# Run static baseline
-uv run python -m src.evaluation.baseline_evaluator --sample-size 12
+# Run baselines (same cases)
+uv run python -m src.evaluation.baseline_evaluator
+uv run python -m src.evaluation.ua_baseline_evaluator
+uv run python -m src.evaluation.fl_baseline_evaluator
 
 # Compute metrics comparison
 uv run python -m src.evaluation.metrics
@@ -908,3 +977,5 @@ uv run python -m src.evaluation.metrics
 - **Phase 1 process anomaly query:** Uses hardcoded time boundaries (`150000`, `157200`) — update these if evaluating different day windows.
 - **Each server file is fully standalone:** No shared state between servers.
 - **Cold events:** `data/cold_events.txt` is a committed research artifact. Do not regenerate during evaluation runs — only regenerate it intentionally by running `generate_cold_events.py` manually.
+- **Eval cases:** `data/eval_cases.txt` is the single case list for the agent and all baselines. Do not add per-evaluator sampling — every method must score the same cases. Regenerate (`generate_eval_cases.py`) only after `cold_events.txt` changes, and re-run every method afterwards.
+- **Tune / test discipline:** prompt or tool changes are evaluated on `--split tune` only. Final reported metrics come from `--split test`, run once per final configuration.

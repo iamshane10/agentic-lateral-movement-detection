@@ -47,7 +47,7 @@ MATCH (u:User {username: $username})-[a:AUTHENTICATED_TO]->(c:Computer)
 WHERE a.time >= $start_time AND a.time <= $end_time
 WITH u,
      count(a) as total_attempts,
-     sum(CASE WHEN a.status = "Success" THEN 1 ELSE 0 END) as failed_attempts,
+     sum(CASE WHEN a.status = "Fail" THEN 1 ELSE 0 END) as failed_attempts,
      collect(DISTINCT c.name) as target_computers,
      collect(DISTINCT a.auth_type) as auth_types_used
 RETURN u.username as username,
